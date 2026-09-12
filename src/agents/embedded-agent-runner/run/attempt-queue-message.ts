@@ -11,6 +11,7 @@ import {
   cancelPendingAgentQuestionForSession,
   claimPendingAgentQuestionAnswer,
 } from "../../harness/gateway-question.js";
+import type { CurrentInboundPromptContext } from "../../internal-runtime-context.js";
 import type { AgentMessage } from "../../runtime/index.js";
 import { retireQueuedUserMessage } from "../../sessions/queued-user-message-retirement.js";
 import {
@@ -22,7 +23,6 @@ import type {
   EmbeddedAgentQueueMessageOptions,
   EmbeddedAgentQueueMessageResult,
 } from "../run-state.js";
-import type { CurrentInboundPromptContext } from "./params.js";
 
 /**
  * Minimal active-session surface needed to steer a running attempt and observe

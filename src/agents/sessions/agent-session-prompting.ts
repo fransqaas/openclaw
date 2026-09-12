@@ -9,9 +9,11 @@ import type {
   PersistedUserTurnMessage,
   UserTurnTranscriptRecorder,
 } from "../../sessions/user-turn-transcript.types.js";
-import type { CurrentInboundPromptContext } from "../embedded-agent-runner/run/params.js";
 import { buildCurrentInboundSteeringPrompt } from "../embedded-agent-runner/run/runtime-context-prompt.js";
-import { resolvePendingRuntimeContextReplay } from "../internal-runtime-context.js";
+import {
+  resolvePendingRuntimeContextReplay,
+  type CurrentInboundPromptContext,
+} from "../internal-runtime-context.js";
 import type { AgentMessage } from "../runtime/index.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { AgentSessionBase } from "./agent-session-base.js";

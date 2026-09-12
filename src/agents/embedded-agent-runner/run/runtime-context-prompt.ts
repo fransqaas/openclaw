@@ -7,9 +7,9 @@ import {
   INTERNAL_RUNTIME_CONTEXT_BEGIN,
   INTERNAL_RUNTIME_CONTEXT_END,
   OPENCLAW_RUNTIME_CONTEXT_CUSTOM_TYPE,
+  type CurrentInboundPromptContext,
   type RuntimeContextFragment,
 } from "../../internal-runtime-context.js";
-import type { CurrentInboundPromptContext } from "./params.js";
 
 const OPENCLAW_RUNTIME_EVENT_USER_PROMPT = "Continue the OpenClaw runtime event.";
 
