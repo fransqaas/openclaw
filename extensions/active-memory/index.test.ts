@@ -37,6 +37,7 @@ import {
   setMinimumTimeoutMsForTests,
   setSetupGraceTimeoutMsForTests,
 } from "./config.js";
+import { registerActiveMemoryEscalationIntegrationTests } from "./index.escalation.test-support.js";
 import plugin from "./index.js";
 import * as recallRun from "./recall-run.js";
 import {
@@ -75,6 +76,7 @@ const hoisted = vi.hoisted(() => {
     },
   };
   return {
+    evaluateDecision: vi.fn(),
     closeActiveMemorySearchManager: vi.fn(async () => {}),
     getActiveMemorySearchManager: vi.fn(async () => ({ manager: null })),
     cleanupSessionLifecycleArtifacts: vi.fn(),
@@ -324,6 +326,7 @@ describe("active-memory plugin", () => {
     name: "Active Memory",
     logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
     runtime: {
+      decisions: { evaluate: hoisted.evaluateDecision },
       agent: {
         runEmbeddedAgent: runtimeRunEmbeddedAgent,
         resolveCliBackendDispatchEligibility,
@@ -1702,6 +1705,18 @@ describe("active-memory plugin", () => {
       expectEmbeddedChannel("telegram");
     },
   );
+
+  registerActiveMemoryEscalationIntegrationTests({
+    expectPrependContextContains,
+    hasDebugLine,
+    hasInfoLine,
+    registerPluginConfig,
+    runEmbeddedAgent,
+    runPromptBuild,
+    evaluateDecision: hoisted.evaluateDecision,
+    updateConfigFile: (update) => (configFile = update(configFile)),
+    skippedRecallContext,
+  });
 
   it("does not run for agents that are not explicitly targeted", async () => {
     const result = await runPromptBuild(
