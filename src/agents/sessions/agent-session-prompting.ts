@@ -466,8 +466,7 @@ export abstract class AgentSessionPrompting extends AgentSessionBase {
     // Expand skill commands and prompt templates
     let expandedText = this.expandSkillCommand(text);
     expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
-    // Commands consume the literal user text; context belongs only to this
-    // model-facing message. The recorder below still owns canonical history.
+    // Expand commands before adding this turn's model-only context.
     const steeringPrompt = buildCurrentInboundSteeringPrompt(expandedText, currentInboundContext);
 
     const preparedMessage = await userTurnTranscriptRecorder?.resolveMessage();

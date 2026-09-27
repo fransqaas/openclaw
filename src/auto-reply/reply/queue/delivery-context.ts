@@ -181,7 +181,9 @@ export function resolveFollowupReplyAnchor(run: FollowupRun): string | undefined
 
 type FollowupRuntimeMetadata = Pick<
   FollowupRun,
+  | "sourceTurnId"
   | "operatorAuthority"
+  | "personalBootstrapEligible"
   | "currentInboundEventKind"
   | "currentInboundAudio"
   | "currentInboundContext"
@@ -259,7 +261,11 @@ export function collectRuntimeMetadata(
     ).values(),
   ];
   return {
+    sourceTurnId: authoritySource?.sourceTurnId,
     operatorAuthority: authoritySource?.operatorAuthority,
+    ...(items.length > 0 && items.every((item) => item.personalBootstrapEligible === true)
+      ? { personalBootstrapEligible: true }
+      : {}),
     currentInboundEventKind: currentTurnSource?.currentInboundEventKind,
     currentInboundAudio: currentTurnSource?.currentInboundAudio,
     currentInboundContext: collectCurrentInboundContext(items),
@@ -276,5 +282,44 @@ export function collectRuntimeMetadata(
     turnAdoptionLifecycle: items.length === 1 ? items[0]?.turnAdoptionLifecycle : undefined,
     replyOperationRunStates: items.flatMap((item) => item.replyOperationRunStates ?? []),
     queuedFollowupReplyDisposition: items.at(-1)?.queuedFollowupReplyDisposition,
+  };
+}
+
+export function createOverflowSummaryRetrySource(source: FollowupRun): FollowupRun {
+  return {
+    prompt: source.prompt,
+    sourceTurnId: source.sourceTurnId,
+    admissionSessionId: source.admissionSessionId,
+    operatorAuthority: source.operatorAuthority,
+    personalBootstrapEligible: source.personalBootstrapEligible,
+    queueAbortSignal: source.queueAbortSignal,
+    transcriptPrompt: source.transcriptPrompt,
+    userTurnTranscriptRecorder: source.userTurnTranscriptRecorder,
+    explicitSkillSelections: source.explicitSkillSelections,
+    toolsAllow: source.toolsAllow,
+    disableTools: source.disableTools,
+    images: source.images,
+    imageOrder: source.imageOrder,
+    media: source.media,
+    channelAdmissionEvidence: source.channelAdmissionEvidence,
+    messageId: source.messageId,
+    summaryLine: source.summaryLine,
+    enqueuedAt: source.enqueuedAt,
+    originatingChannel: source.originatingChannel,
+    originatingTo: source.originatingTo,
+    originatingAccountId: source.originatingAccountId,
+    originatingThreadId: source.originatingThreadId,
+    originatingChatId: source.originatingChatId,
+    originatingReplyToId: source.originatingReplyToId,
+    originatingReplyToMode: source.originatingReplyToMode,
+    originatingChatType: source.originatingChatType,
+    abortSignal: source.abortSignal,
+    turnAdoptionLifecycle: source.turnAdoptionLifecycle,
+    replyOperationRunStates: source.replyOperationRunStates,
+    queuedFollowupReplyDisposition: source.queuedFollowupReplyDisposition,
+    ...(source.currentInboundEventKind === "room_event"
+      ? { currentInboundEventKind: "room_event" }
+      : {}),
+    run: source.run,
   };
 }

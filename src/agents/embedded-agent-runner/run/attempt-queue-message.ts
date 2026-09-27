@@ -68,7 +68,7 @@ function steerActiveSession(
   canInject?: () => boolean,
   currentInboundContext?: CurrentInboundPromptContext,
 ): Promise<void> {
-  if (currentInboundContext) {
+  if (currentInboundContext || canInject) {
     return activeSession.steer(
       text,
       images,
@@ -78,17 +78,6 @@ function steerActiveSession(
       queueIdentity,
       canInject,
       currentInboundContext,
-    );
-  }
-  if (canInject) {
-    return activeSession.steer(
-      text,
-      images,
-      userTurnTranscriptRecorder,
-      media,
-      imageOrder,
-      queueIdentity,
-      canInject,
     );
   }
   if (media?.length || queueIdentity) {

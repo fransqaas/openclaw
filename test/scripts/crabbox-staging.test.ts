@@ -16,17 +16,23 @@ import {
 import { tmpdir } from "node:os";
 import { basename, delimiter, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { hasUnjoinedWork, runManagedCommand } from "../../scripts/lib/managed-child-process.mts";
+import { resolveVitestNodeArgs } from "../../scripts/lib/vitest-process-env.mts";
+import {
+  resolveRuntimeWorkerArgv,
+  resolveRuntimeWorkerUrl,
+} from "../../src/infra/runtime-worker-url.js";
+import { resolveTestNodeExecPath } from "../../src/test-utils/node-process.js";
 import {
   createFixtureDiagnostics,
   type FixtureDiagnostics,
 } from "../helpers/fixture-diagnostics.js";
 import { createNestedGitEnv } from "../helpers/temp-repo.js";
+import { toolingMtsEntrypoints } from "./tooling-mts-runtime.test-support.mts";
 
 const repository = fileURLToPath(new URL("../../", import.meta.url));
-const scriptUrl = (name: string) => new URL("../../scripts/" + name, import.meta.url).href;
 const artifactBytes = Buffer.from([0, 255, 128, 10, 65]);
 type Receipt = {
   version: number;
@@ -73,6 +79,8 @@ async function withFixture(scenario: (context: ReturnType<typeof createFixture>)
 }
 
 function createFixture(diagnostics?: FixtureDiagnostics) {
+  const nodeExecutable = resolveTestNodeExecPath();
+  const nodeArgs = resolveVitestNodeArgs();
   // openclaw-temp-dir: allow retain input ownership when a child cannot be joined
   const root = mkdtempSync(join(tmpdir(), "openclaw-crabbox-recovery-"));
   const source = join(root, "source"),
@@ -82,6 +90,7 @@ function createFixture(diagnostics?: FixtureDiagnostics) {
   const cli = join(bin, "crabbox"),
     plan = join(root, "inventory.json"),
     calls = join(root, "native-calls.jsonl"),
+    nodePolicy = join(root, "node-policy.jsonl"),
     state = join(root, "state");
   for (const path of [source, staging, bin, home, join(state, "crabbox", "claims")]) {
     mkdirSync(path, { recursive: true });
@@ -131,11 +140,13 @@ function createFixture(diagnostics?: FixtureDiagnostics) {
   ) => writeFileSync(plan, JSON.stringify({ claims, gate }));
   inventory();
   writeFileSync(calls, "");
+  writeFileSync(nodePolicy, "");
   writeFileSync(
     cli,
-    `#!${process.execPath}
+    `#!/usr/bin/env -S ${JSON.stringify(nodeExecutable)} ${nodeArgs.join(" ")}
 const fs = require('node:fs');
 const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(nodePolicy)}, JSON.stringify({entry:'claims-cli', nodeArgs:process.execArgv.filter(flag=>${JSON.stringify(nodeArgs)}.includes(flag))}) + '\\n');
 fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + '\\n');
 if (JSON.stringify(args) !== JSON.stringify(['claims','list','--json'])) process.exit(91);
 const plan = JSON.parse(fs.readFileSync(${JSON.stringify(plan)}, 'utf8'));
@@ -219,10 +230,13 @@ if (plan.gate) {
   };
   const program = (body: string, prelude = "", timeoutMs = 30_000, role = "program") =>
     command(
-      process.execPath,
+      nodeExecutable,
       [
-        "--import",
-        resolve(repository, "scripts/tsx.mjs"),
+        ...nodeArgs,
+        ...resolveRuntimeWorkerArgv(
+          resolveRuntimeWorkerUrl(toolingMtsEntrypoints.crabboxSourceCapsule),
+          nodeExecutable,
+        ).slice(0, -1),
         "--input-type=module",
         "-e",
         `import fs from 'node:fs';
@@ -233,10 +247,10 @@ import {syncBuiltinESMExports} from 'node:module';
 const ctx = ${JSON.stringify({ root, repository: source, staging, cli, calls })};
 ${prelude}
 syncBuiltinESMExports();
-const {prepareCrabboxSourceCapsule} = await import(${JSON.stringify(scriptUrl("crabbox-source-capsule.mts"))});
-const {createStaging,discoverStaging,recoverDiscoveredStaging,runStagingCommand} = await import(${JSON.stringify(scriptUrl("crabbox-staging.mts"))});
-const {captureClaimNamespace} = await import(${JSON.stringify(scriptUrl("crabbox-staging-claims.mts"))});
-const {preserveCrabboxArtifacts} = await import(${JSON.stringify(scriptUrl("crabbox-staging-artifacts.mts"))});
+const {prepareCrabboxSourceCapsule} = await import(${JSON.stringify(resolveRuntimeWorkerUrl(toolingMtsEntrypoints.crabboxSourceCapsule).href)});
+const {createStaging,createMirrorStaging,discoverStaging,recoverDiscoveredStaging,runStagingCommand} = await import(${JSON.stringify(resolveRuntimeWorkerUrl(toolingMtsEntrypoints.crabboxStaging).href)});
+const {captureClaimNamespace} = await import(${JSON.stringify(resolveRuntimeWorkerUrl(toolingMtsEntrypoints.crabboxStagingClaims).href)});
+const {preserveCrabboxArtifacts} = await import(${JSON.stringify(resolveRuntimeWorkerUrl(toolingMtsEntrypoints.crabboxStagingArtifacts).href)});
 ${body}`,
       ],
       {},
@@ -248,27 +262,33 @@ ${body}`,
     options: { paths?: string[]; before?: string; prelude?: string; localGitSeed?: boolean } = {},
   ) => {
     const names = options.paths ?? ["source.txt"];
-    const selection = `const fs=require('node:fs');const paths=${JSON.stringify(names)}.filter(path=>fs.lstatSync(path,{throwIfNoEntry:false}));process.stdout.write(JSON.stringify({candidate:{files:paths.length},topFiles:paths.map(path=>({path})),localGitSeed:${options.localGitSeed ? "{source:'local'}" : "undefined"}}));`;
+    const selection = `const fs=require('node:fs');fs.appendFileSync(${JSON.stringify(nodePolicy)},JSON.stringify({entry:'source-selection',nodeArgs:process.execArgv.filter(flag=>${JSON.stringify(nodeArgs)}.includes(flag))})+'\\n');const paths=${JSON.stringify(names)}.filter(path=>fs.lstatSync(path,{throwIfNoEntry:false}));process.stdout.write(JSON.stringify({candidate:{files:paths.length},topFiles:paths.map(path=>({path})),localGitSeed:${options.localGitSeed ? "{source:'local'}" : "undefined"}}));`;
     const result = await program(
       `
 ${options.before ?? ""}
-const cap = prepareCrabboxSourceCapsule({repoRoot:ctx.repository,syncRoot:ctx.staging,base:'HEAD',syncPlan:{command:process.execPath,args:['-e',${JSON.stringify(selection)}]}});
+const cap = prepareCrabboxSourceCapsule({repoRoot:ctx.repository,syncRoot:ctx.staging,base:'HEAD',syncPlan:{command:process.execPath,args:${JSON.stringify([...nodeArgs, "-e", selection])}}});
 let artifacts;
 ${after}
 const receipt = JSON.parse(fs.readFileSync(join(cap.staging.root,'staging.json'),'utf8'));
-fs.writeSync(1,JSON.stringify({root:cap.staging.root,source:cap.directory,receipt,destination:artifacts?.kind==='copied'?artifacts.destination.path:undefined}));
+fs.writeSync(1,JSON.stringify({nodeArgs:process.execArgv.slice(0,process.execArgv.indexOf('-e')),root:cap.staging.root,source:cap.directory,receipt,destination:artifacts?.kind==='copied'?artifacts.destination.path:undefined}));
 process.kill(process.pid,'SIGKILL');`,
       options.prelude,
       options.before ? 120_000 : 30_000,
       "prepare",
     );
     expect(result.signal, result.stderr).toBe("SIGKILL");
-    return JSON.parse(result.stdout) as Stage;
+    const { nodeArgs: producerNodeArgs, ...stage } = JSON.parse(result.stdout) as Stage & {
+      nodeArgs: string[];
+    };
+    expect(producerNodeArgs, "fixture producer inherits the Node shutdown policy").toContain(
+      "--no-concurrent-sparkplug",
+    );
+    return stage;
   };
   const wrapper = (args: string[], override: NodeJS.ProcessEnv = {}) =>
     command(
-      process.execPath,
-      [resolve(repository, "scripts/crabbox-wrapper.mjs"), "staging", ...args],
+      nodeExecutable,
+      [...nodeArgs, resolve(repository, "scripts/crabbox-wrapper.mjs"), "staging", ...args],
       override,
       undefined,
       "wrapper",
@@ -300,6 +320,11 @@ process.kill(process.pid,'SIGKILL');`,
     env,
     cli,
     calls,
+    nodePolicies: () =>
+      readFileSync(nodePolicy, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { entry: string; nodeArgs: string[] }),
     command,
     program,
     prepare,
@@ -346,6 +371,248 @@ syncBuiltinESMExports();try{cap.staging.dispose();}catch(error){if(!interrupted)
 if(!interrupted)throw new Error('fixture failed to interrupt disposal');`;
 }
 
+const seedMirror = `
+function seed(owner) {
+  if (!owner) throw new Error('mirror allocation failed');
+  const source=join(owner.staging.payload,'source');fs.mkdirSync(source);
+  const bytes=Buffer.from('uncommitted mirror source\\n');fs.writeFileSync(join(source,'source.txt'),bytes);
+  fs.writeFileSync(join(owner.staging.root,'mirror.sqlite'),'closed fixture cache');
+  const blob=crypto.createHash('sha1').update('blob '+bytes.length+'\\0').update(bytes).digest('hex');
+  owner.staging.prepared({files:[{path:'source.txt',mode:'100644',blob}],deleted:[]});
+  return source;
+}`;
+
+describe.skipIf(process.platform === "win32")("Crabbox reusable staging ownership", () => {
+  it("seals and reuses a large cache database with bounded read buffers", async () =>
+    withFixture(async (f) => {
+      const result = await f.program(`${seedMirror}
+const {DatabaseSync}=await import('node:sqlite');
+const owner=createMirrorStaging(ctx.staging,ctx.repository);seed(owner);
+const path=join(owner.staging.root,'mirror.sqlite');fs.rmSync(path);
+const database=new DatabaseSync(path);
+database.exec('CREATE TABLE payload (bytes BLOB); INSERT INTO payload VALUES (zeroblob(65 * 1024 * 1024))');
+database.close();
+const bytes=fs.statSync(path).size;
+const allocate=Buffer.alloc;
+Buffer.alloc=(size,...args)=>{if(size>128*1024)throw new Error('unbounded cache allocation');return allocate(size,...args);};
+try {
+  owner.finish();
+  const next=createMirrorStaging(ctx.staging,ctx.repository);
+  if(!next?.reused||next.staging.root!==owner.staging.root)throw new Error('large cache was not reused');
+  next.discard();
+} finally { Buffer.alloc=allocate; }
+console.log(JSON.stringify({bytes}));`);
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout).bytes).toBeGreaterThan(64 * 1024 * 1024);
+    }));
+
+  it("holds an exclusive command view and only adopts an explicit idle handoff", async () =>
+    withFixture(async (f) => {
+      const result = await f.program(`${seedMirror}
+const first=createMirrorStaging(ctx.staging,ctx.repository);const source=seed(first);
+const inode=fs.statSync(join(source,'source.txt')).ino;
+const busy=createMirrorStaging(ctx.staging,ctx.repository)===undefined;
+fs.mkdirSync(join(source,'.crabbox','runs'),{recursive:true});
+fs.mkdirSync(join(source,'.crabbox','captures'));
+fs.writeFileSync(join(source,'.crabbox','runs','output.log'),'native output');
+first.staging.admitted(captureClaimNamespace(source));first.staging.settled();
+const artifacts=preserveCrabboxArtifacts(source,ctx.repository);first.staging.preserved(artifacts);
+first.finish();
+const pruned=!fs.existsSync(join(source,'.crabbox'));
+const preserved=fs.readFileSync(join(artifacts.destination.path,'runs','output.log'),'utf8')==='native output';
+const next=createMirrorStaging(ctx.staging,ctx.repository);
+const reused=next?.reused===true&&next.staging.root===first.staging.root;
+const unchanged=fs.statSync(join(source,'source.txt')).ino===inode;
+next.discard();
+console.log(JSON.stringify({busy,reused,unchanged,pruned,preserved,removed:!fs.existsSync(first.staging.root)}));`);
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        busy: true,
+        reused: true,
+        unchanged: true,
+        pruned: true,
+        preserved: true,
+        removed: true,
+      });
+    }));
+
+  it("preserves admitted, merely settled, and unverified writers instead of inferring idle authority", async () =>
+    withFixture(async (f) => {
+      const result = await f.program(`${seedMirror}
+const states=[];
+for(const state of ['admitted','settled','writers']){
+  const root=join(ctx.root,state);const owner=createMirrorStaging(root,ctx.repository);const source=seed(owner);
+  if(state==='writers')owner.staging.hold('writers');
+  else {owner.staging.admitted(captureClaimNamespace(source));if(state==='settled')owner.staging.settled();}
+  owner.finish();
+  const next=createMirrorStaging(root,ctx.repository);
+  states.push({state,reused:next!==undefined,retained:fs.readFileSync(join(source,'source.txt'),'utf8')==='uncommitted mirror source\\n'});
+}
+const unsafe=createMirrorStaging(join(ctx.root,'unsafe-discard'),ctx.repository);const unsafeSource=seed(unsafe);
+unsafe.staging.admitted(captureClaimNamespace(unsafeSource));
+let refused=false;try{unsafe.discard();}catch{refused=true;}
+if(!refused||!fs.existsSync(unsafeSource))throw new Error('admitted source was discarded');
+const unknown=createMirrorStaging(join(ctx.root,'unknown-output'),ctx.repository);const unknownSource=seed(unknown);
+fs.mkdirSync(join(unknownSource,'.crabbox'));fs.writeFileSync(join(unknownSource,'.crabbox','unowned'),'keep');
+unknown.staging.admitted(captureClaimNamespace(unknownSource));unknown.staging.settled();
+unknown.staging.preserved(preserveCrabboxArtifacts(unknownSource,ctx.repository));
+unknown.finish();
+if(fs.existsSync(unknown.staging.root))throw new Error('settled native state was retained instead of ordinary disposal');
+const replacement=createMirrorStaging(join(ctx.root,'unknown-output'),ctx.repository);
+if(!replacement||replacement.reused)throw new Error('disposed native state did not rebuild cold');replacement.discard();
+const damaged=createMirrorStaging(join(ctx.root,'damaged-output'),ctx.repository);const damagedSource=seed(damaged);
+fs.mkdirSync(join(damagedSource,'.crabbox','runs'),{recursive:true});
+fs.writeFileSync(join(damagedSource,'.crabbox','runs','output.log'),'original');fs.writeFileSync(join(damagedSource,'.crabbox','state'),'native state');
+damaged.staging.admitted(captureClaimNamespace(damagedSource));damaged.staging.settled();
+damaged.staging.preserved(preserveCrabboxArtifacts(damagedSource,ctx.repository));
+fs.writeFileSync(join(damagedSource,'.crabbox','runs','output.log'),'changed');
+let held=false;try{damaged.finish();}catch{held=true;}
+if(!held||!fs.existsSync(damaged.staging.root))throw new Error('unverified output was disposed');
+console.log(JSON.stringify(states));`);
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual(
+        ["admitted", "settled", "writers"].map((state) => ({
+          state,
+          reused: false,
+          retained: true,
+        })),
+      );
+    }));
+
+  it("releases crashed kernel locks without treating an admitted crash as settled", async () =>
+    withFixture(async (f) => {
+      const allocation = await f.program(
+        "createMirrorStaging(ctx.staging,ctx.repository);throw new Error('allocation did not hold its lock');",
+        `const {DatabaseSync}=await import('node:sqlite');
+const execute=DatabaseSync.prototype.exec;
+DatabaseSync.prototype.exec=function(sql){const result=execute.call(this,sql);if(sql.includes('BEGIN EXCLUSIVE'))process.kill(process.pid,'SIGKILL');return result;};`,
+      );
+      expect(allocation.signal, allocation.stderr).toBe("SIGKILL");
+      const afterAllocation = await f.program(`${seedMirror}
+const owner=createMirrorStaging(ctx.staging,ctx.repository);seed(owner);owner.discard();`);
+      expect(afterAllocation.status, afterAllocation.stderr).toBe(0);
+
+      const idle = await f.program(
+        `${seedMirror}
+const owner=createMirrorStaging(ctx.staging,ctx.repository);const source=seed(owner);
+const receipt=JSON.parse(fs.readFileSync(join(owner.staging.root,'staging.json'),'utf8'));
+fs.writeSync(1,JSON.stringify({root:owner.staging.root,source,receipt}));
+killOnRollback=true;owner.finish();throw new Error('idle owner unlocked without crashing');`,
+        `const {DatabaseSync}=await import('node:sqlite');let killOnRollback=false;
+const execute=DatabaseSync.prototype.exec;
+DatabaseSync.prototype.exec=function(sql){if(killOnRollback&&sql==='ROLLBACK')process.kill(process.pid,'SIGKILL');return execute.call(this,sql);};`,
+      );
+      expect(idle.signal, idle.stderr).toBe("SIGKILL");
+      const idleStage = JSON.parse(idle.stdout) as Stage;
+      expect((await f.recover(idleStage)).report.recovered).toBe(true);
+
+      const admitted = await f.program(`${seedMirror}
+const owner=createMirrorStaging(ctx.staging,ctx.repository);const source=seed(owner);
+owner.staging.admitted(captureClaimNamespace(source));
+const receipt=JSON.parse(fs.readFileSync(join(owner.staging.root,'staging.json'),'utf8'));
+fs.writeSync(1,JSON.stringify({root:owner.staging.root,source,receipt}));process.kill(process.pid,'SIGKILL');`);
+      expect(admitted.signal, admitted.stderr).toBe("SIGKILL");
+      const admittedStage = JSON.parse(admitted.stdout) as Stage;
+      expect((await f.recover(admittedStage)).report.recovered).toBe(false);
+      const refused = await f.program(
+        "if(createMirrorStaging(ctx.staging,ctx.repository)!==undefined)throw new Error('admitted mirror was adopted');",
+      );
+      expect(refused.status, refused.stderr).toBe(0);
+      expect(readFileSync(join(admittedStage.source, "source.txt"), "utf8")).toBe(
+        "uncommitted mirror source\n",
+      );
+    }));
+
+  it("rebuilds corrupt cache or witness metadata without following a database symlink", async () =>
+    withFixture(async (f) => {
+      const result = await f.program(`${seedMirror}
+const outcomes=[];const secret=join(ctx.root,'outside');fs.writeFileSync(secret,'private sentinel');
+for(const fault of ['missing','changed','symlink','witness','journal']){
+  const root=join(ctx.root,fault);const owner=createMirrorStaging(root,ctx.repository);seed(owner);owner.finish();
+  const database=join(owner.staging.root,'mirror.sqlite');
+  if(fault==='changed')fs.writeFileSync(database,'corrupted cache');
+  else if(fault==='witness'){
+    const path=join(owner.staging.root,'staging.json');const receipt=JSON.parse(fs.readFileSync(path,'utf8'));
+    receipt.witness={gitDir:join(ctx.repository,'.git'),ref:'refs/heads/main',commit:'0'.repeat(40)};
+    fs.writeFileSync(path,JSON.stringify(receipt));
+  }
+  else if(fault==='journal')fs.writeFileSync(database+'-journal','unsettled data');
+  else {fs.rmSync(database);if(fault==='symlink')fs.symlinkSync(secret,database);}
+  const next=createMirrorStaging(root,ctx.repository);
+  outcomes.push({fault,cold:next?.reused===false,replaced:next?.staging.root!==owner.staging.root,removed:!fs.existsSync(owner.staging.root)});
+  next.discard();
+}
+console.log(JSON.stringify({outcomes,secret:fs.readFileSync(secret,'utf8')}));`);
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        outcomes: ["missing", "changed", "symlink", "witness", "journal"].map((fault) => ({
+          fault,
+          cold: true,
+          replaced: true,
+          removed: true,
+        })),
+        secret: "private sentinel",
+      });
+    }));
+
+  it("keeps idle mirrors during automatic discovery and reclaims them through explicit staging recovery", async () =>
+    withFixture(async (f) => {
+      const result = await f.program(`${seedMirror}
+const owner=createMirrorStaging(ctx.staging,ctx.repository);seed(owner);owner.finish();
+const discovery=discoverStaging(ctx.staging);
+const automatic=await recoverDiscoveredStaging(ctx.staging,discovery,{binary:ctx.cli,cwd:ctx.repository});
+if(automatic?.recovered||!fs.existsSync(owner.staging.root))throw new Error('automatic discovery disposed a reusable mirror');
+const id=JSON.parse(fs.readFileSync(join(owner.staging.root,'staging.json'),'utf8')).id;
+await runStagingCommand(['recover',id],ctx.staging,{binary:ctx.cli,cwd:ctx.repository});
+if(fs.existsSync(owner.staging.root))throw new Error('explicit recovery retained disposable mirror');`);
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({ recovered: true });
+      expect(readFileSync(f.calls, "utf8")).toBe("");
+    }));
+
+  it("bounds protected allocations and skips a corrupt oldest mirror when evicting idle copies", async () =>
+    withFixture(async (f) => {
+      const result = await f.program(`${seedMirror}
+const protectedRoot=join(ctx.root,'protected');fs.mkdirSync(join(protectedRoot,'mirrors'),{recursive:true,mode:0o700});
+for(let i=0;i<32;i++)fs.mkdirSync(join(protectedRoot,'mirrors',String(i).padStart(64,'0')),{mode:0o700});
+const refused=createMirrorStaging(protectedRoot,ctx.repository)===undefined;
+const namespaceVictim=join(ctx.root,'namespace-victim');fs.mkdirSync(namespaceVictim,{mode:0o700});
+fs.writeFileSync(join(namespaceVictim,'sentinel'),'preserve victim');
+const namespaceFallback=[];
+for(const kind of ['symlink','file']){
+  const root=join(ctx.root,'namespace-'+kind);fs.mkdirSync(root);
+  if(kind==='symlink')fs.symlinkSync(namespaceVictim,join(root,'mirrors'));
+  else fs.writeFileSync(join(root,'mirrors'),'preserve replacement');
+  namespaceFallback.push(createMirrorStaging(root,ctx.repository)===undefined);
+  if(kind==='symlink'&&fs.readlinkSync(join(root,'mirrors'))!==namespaceVictim)throw new Error('mirror namespace link changed');
+}
+if(fs.readFileSync(join(ctx.root,'namespace-file','mirrors'),'utf8')!=='preserve replacement')throw new Error('replacement namespace changed');
+const old=[];
+const corruptMetadata='artifacts-'+'0'.repeat(64)+'.json';
+for(let i=0;i<33;i++){
+  const repo=join(ctx.root,'repo-'+i);fs.mkdirSync(repo);
+  const init=cp.spawnSync('git',['-C',repo,'init','--quiet','--template=']);if(init.status!==0)throw new Error('git init failed');
+  const owner=createMirrorStaging(ctx.staging,repo);seed(owner);owner.finish();old.push(owner.staging.root);
+  const receiptPath=join(owner.staging.root,'staging.json');const receipt=JSON.parse(fs.readFileSync(receiptPath,'utf8'));
+  receipt.mirror.lastUsed=i;fs.writeFileSync(receiptPath,JSON.stringify(receipt));
+  if(i===0)fs.writeFileSync(join(owner.staging.root,corruptMetadata),'malformed recovery metadata');
+}
+console.log(JSON.stringify({refused,namespaceFallback,namespaceVictimPreserved:fs.readdirSync(namespaceVictim).length===1&&fs.readFileSync(join(namespaceVictim,'sentinel'),'utf8')==='preserve victim',protectedSlots:fs.readdirSync(join(protectedRoot,'mirrors')).filter(name=>name!=='.allocation.lock').length,slots:fs.readdirSync(join(ctx.staging,'mirrors')).filter(name=>name!=='.allocation.lock').length,surviving:old.filter(path=>fs.existsSync(path)).length,newest:fs.existsSync(old[32]),corruptRetained:fs.readFileSync(join(old[0],corruptMetadata),'utf8')==='malformed recovery metadata',healthyVictimRemoved:!fs.existsSync(old[1])}));`);
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        refused: true,
+        namespaceFallback: [true, true],
+        namespaceVictimPreserved: true,
+        protectedSlots: 32,
+        slots: 32,
+        surviving: 32,
+        newest: true,
+        corruptRetained: true,
+        healthyVictimRemoved: true,
+      });
+    }));
+});
+
 function orderedDirectories(names: string[], position: "first" | "last") {
   return `const order=${JSON.stringify(names)};const originalDirectory=fs.opendirSync;
 fs.opendirSync=(path,...args)=>{const directory=originalDirectory(path,...args);if(resolve(path)===resolve(ctx.staging)){const entries=[];for(let entry;(entry=directory.readSync());)entries.push(entry);const rank=(name)=>{const index=order.indexOf(name);return index<0?${position === "first" ? "order.length" : "-1"}:index;};entries.sort((left,right)=>rank(left.name)-rank(right.name)||left.name.localeCompare(right.name));let next=0;directory.readSync=()=>entries[next++]??null;}return directory;};`;
@@ -369,6 +636,13 @@ describe.skipIf(process.platform === "win32")(
           const recovered = await f.recover(stage);
           expect(recovered.status, recovered.stderr + recovered.stdout).toBe(0);
           expect(recovered.report).toMatchObject({ id: stage.receipt.id, recovered: true });
+          const policies = f.nodePolicies();
+          expect(new Set(policies.map(({ entry }) => entry))).toEqual(
+            new Set(["source-selection", "claims-cli"]),
+          );
+          for (const policy of policies) {
+            expect(policy.nodeArgs, policy.entry).toEqual(resolveVitestNodeArgs());
+          }
           expect(readdirSync(f.staging)).toEqual([]);
           expect(readFileSync(join(f.source, "source.txt"), "utf8")).toBe("retained source\n");
           expect(f.git("rev-parse", "HEAD")).toBe(before);
@@ -383,6 +657,27 @@ describe.skipIf(process.platform === "win32")(
         withFixture(async (f) => {
           const config = join(f.root, "home", ".gitconfig");
           const callback = join(f.root, "callback.sh");
+          const localRecoveryGuard = join(f.root, "local-recovery-guard.mjs");
+          writeFileSync(
+            localRecoveryGuard,
+            String.raw`import { registerHooks } from "node:module";
+registerHooks({ load(url, context, nextLoad) {
+  const path = new URL(url).pathname;
+  if (/\/plugin-sdk\/process-runtime\.(?:ts|js)$/.test(path)) {
+    throw new Error("Protected local recovery loaded the command runtime");
+  }
+  return nextLoad(url, context);
+} });
+`,
+          );
+          const localRecoveryEnv = {
+            NODE_OPTIONS: [
+              process.env.NODE_OPTIONS,
+              `--import=${pathToFileURL(localRecoveryGuard).href}`,
+            ]
+              .filter(Boolean)
+              .join(" "),
+          };
           writeFileSync(callback, "#!/bin/sh\nprintf 'fixture-token\\000'\n", { mode: 0o700 });
           let first: Stage | undefined;
           for (const [section, key] of [
@@ -413,7 +708,10 @@ describe.skipIf(process.platform === "win32")(
               users: "settled",
               hold: "writers",
             });
-            expect((await f.recover(stage)).report).toMatchObject({
+            const recovery = await f.wrapper(["recover", stage.receipt.id], localRecoveryEnv);
+            expect(recovery.status, recovery.stderr).toBe(1);
+            expect(recovery.stdout, recovery.stderr).not.toBe("");
+            expect(JSON.parse(recovery.stdout)).toMatchObject({
               recovered: false,
               reason: expect.stringContaining("settlement is unverified"),
             });

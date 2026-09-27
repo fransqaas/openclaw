@@ -44,7 +44,6 @@ import type {
   SpawnSubagentParams,
   SpawnSubagentResult,
 } from "./subagent-spawn-contract.js";
-import { setSubagentSpawnDepsForTest } from "./subagent-spawn-deps.js";
 import {
   buildSubagentExecutionSessionSpawnContext,
   withSubagentGatewayExecutionIdentity,
@@ -79,7 +78,7 @@ export async function spawnSubagentDirect(
     gatewayScope?.context?.resolveGatewayContext;
   const operatorAuthority =
     gatewayCaller?.operatorAuthority ?? gatewayScope?.client?.internal?.operatorRunAuthority;
-  const requestResolution = resolveSubagentSpawnRequest(params, ctx);
+  const requestResolution = await resolveSubagentSpawnRequest(params, ctx);
   if (!requestResolution.ok) {
     return requestResolution.result;
   }
@@ -129,6 +128,7 @@ export async function spawnSubagentDirect(
   let provisionalCleanupOpen = true;
   let contextEnginePreparation: PreparedContextEngineSubagentSpawn | undefined;
   try {
+    assertActive?.();
     if (reservationPending && !swarmReservation) {
       return { status: "error", error: "Collector FIFO reservation is no longer current" };
     }
@@ -168,7 +168,6 @@ export async function spawnSubagentDirect(
       resolvedModelMetadata,
     } = childPlan.resolved;
     let { childSessionOrigin } = childPlan.resolved;
-    const spawnedByKey = requesterInternalKey;
     const { resolvedModel, thinkingOverride } = plan;
     const initialSession = await createInitialSubagentSession({
       assertActive,
@@ -342,7 +341,7 @@ export async function spawnSubagentDirect(
         completionMode,
         spawnMode,
         message: envelope.message,
-        spawnedByKey,
+        spawnedByKey: requesterInternalKey,
         toolSpawnMetadata,
         spawnedWorkspaceDir,
         childSessionKey,
@@ -671,6 +670,8 @@ export async function spawnSubagentDirect(
       await emitSpawnLifecycleHooks(childRunId);
     }
 
+    // Publish only after preparation releases its hold and exposes the scheduler's capacity state.
+    await swarmReservation?.release();
     // Emit lifecycle event so the gateway can broadcast sessions.changed to SSE subscribers.
     emitSessionLifecycleEvent({
       sessionKey: childSessionKey,
@@ -713,14 +714,4 @@ export async function spawnSubagentDirect(
       await swarmReservation?.release();
     }
   }
-}
-
-const testing = {
-  setDepsForTest(overrides?: Parameters<typeof setSubagentSpawnDepsForTest>[0]) {
-    setSubagentSpawnDepsForTest(overrides);
-  },
-};
-if (process.env.VITEST || process.env.NODE_ENV === "test") {
-  (globalThis as Record<PropertyKey, unknown>)[Symbol.for("openclaw.subagentSpawnTestApi")] =
-    testing;
 }

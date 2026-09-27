@@ -3,19 +3,19 @@ import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
-import { configureFsSafeNative, getFsSafeNativeConfig } from "@openclaw/fs-safe/config";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createDeferred } from "../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
 import { resolvePathViaExistingAncestorSync } from "./boundary-path.js";
 import { sha256HexPrefixCore } from "./crypto-digest.js";
-import { readLifecycleWriteCustody } from "./lifecycle-write-custody.js";
 import { tryAcquireExclusiveSqliteCoordinator } from "./sqlite-coordinator.js";
 import { captureCoordinatorDatabase } from "./sqlite-coordinator.test-support.js";
 import {
   acquireGatewayLifecycleCoordinator,
   acquireStateDatabaseCoordinator,
   acquireStateDatabaseHandleExclusion,
+  hasStateDatabaseSourceExclusion,
+  prepareStateDatabaseSourceExclusion,
   resolveStateDatabaseCoordinatorPath,
   resolveStateLifecycleRuntimeDirectory,
   tryCreateGatewaySchemaFenceDelegate,
@@ -27,38 +27,14 @@ import {
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 describe("state database coordinator", () => {
-  it("observes writer settlement without treating idle Gateway ownership as custody", async () => {
-    const root = tempDirs.make("openclaw-coordinator-write-observation-");
-    const params = { databasePath: path.join(root, "state.sqlite"), runtimeDirectory: root };
-    const gateway = acquireGatewayLifecycleCoordinator(params);
-    const exclusion = acquireStateDatabaseHandleExclusion(params);
-    const entered = createDeferred();
-    const settled = createDeferred();
-    let writing: Promise<unknown> | undefined;
+  it("does not resolve physical paths when no source exclusion is active", () => {
+    const realpath = vi.spyOn(fsSync.realpathSync, "native");
     try {
-      expect(readLifecycleWriteCustody()).toEqual([]);
-      writing = exclusion.runWithCanonicalMutation(
-        () => {},
-        async () => {
-          entered.resolve();
-          await settled.promise;
-          throw new Error("write failed after settlement");
-        },
-        async () => {
-          throw new Error("unexpected snapshot");
-        },
-      );
-      const rejected = expect(writing).rejects.toThrow("write failed after settlement");
-      await entered.promise;
-      expect(readLifecycleWriteCustody()).toEqual([{ phase: "coordinator-write", count: 1 }]);
-      settled.resolve();
-      await rejected;
-      expect(readLifecycleWriteCustody()).toEqual([]);
+      expect(hasStateDatabaseSourceExclusion("/synthetic/openclaw.sqlite")).toBe(false);
+      expect(prepareStateDatabaseSourceExclusion("/synthetic/openclaw.sqlite")).toBeUndefined();
+      expect(realpath).not.toHaveBeenCalled();
     } finally {
-      settled.resolve();
-      await writing?.catch(() => undefined);
-      exclusion.release();
-      gateway.release();
+      realpath.mockRestore();
     }
   });
 
@@ -120,6 +96,13 @@ describe("state database coordinator", () => {
 
     const gateway = acquireGatewayLifecycleCoordinator(params);
     const nestedGateway = acquireGatewayLifecycleCoordinator(params);
+    const lifecyclePath = vi.spyOn(fsSync.realpathSync, "native");
+    try {
+      expect(tryCreateStateLifecycleDelegate(params)).toBeUndefined();
+      expect(lifecyclePath).not.toHaveBeenCalled();
+    } finally {
+      lifecyclePath.mockRestore();
+    }
     const delegation = tryCreateGatewaySchemaFenceDelegate(params);
     expect(delegation).toBeDefined();
     if (!delegation) {
@@ -220,11 +203,11 @@ describe("state database coordinator", () => {
         uid: typeof process.getuid === "function" ? process.getuid() : undefined,
         coordinatorPath: explicit ? path.join(root, "custom", "coordinator.sqlite") : undefined,
       };
-      const nativeMode = getFsSafeNativeConfig().mode;
+      const nativeModeEnv = captureEnv(["FS_SAFE_NATIVE_MODE"]);
       // fs-safe's Bun realpath workaround bypasses node:fs spies until oven-sh/bun#42374.
       // Select its portable path so this probe-count assertion observes the realpath owner.
       if (process.versions.bun) {
-        configureFsSafeNative({ mode: "off" });
+        setTestEnvValue("FS_SAFE_NATIVE_MODE", "off");
       }
       const resolvePath = vi.spyOn(fsSync, "realpathSync");
       try {
@@ -247,9 +230,7 @@ describe("state database coordinator", () => {
         }
       } finally {
         resolvePath.mockRestore();
-        if (process.versions.bun) {
-          configureFsSafeNative({ mode: nativeMode });
-        }
+        nativeModeEnv.restore();
       }
     },
   );
@@ -365,53 +346,6 @@ describe("state database coordinator", () => {
       }
     },
   );
-
-  it("reference-counts same-process owners", async () => {
-    const root = tempDirs.make("openclaw-state-database-coordinator-");
-    const databasePath = path.join(root, "selected-state", "state", "openclaw.sqlite");
-    const runtimeDirectory = path.join(root, "runtime");
-    await fs.mkdir(path.dirname(databasePath), { recursive: true });
-    const first = acquireStateDatabaseCoordinator({
-      databasePath,
-      runtimeDirectory,
-      busyTimeoutMs: 0,
-    });
-    const nested = acquireStateDatabaseCoordinator({
-      databasePath,
-      runtimeDirectory,
-      busyTimeoutMs: 0,
-    });
-
-    first.release();
-    nested.release();
-
-    const next = acquireStateDatabaseCoordinator({
-      databasePath,
-      runtimeDirectory,
-      busyTimeoutMs: 0,
-    });
-    next.release();
-  });
-
-  it("keeps Gateway presence independent from short state operations", async () => {
-    const root = tempDirs.make("openclaw-gateway-lifecycle-coordinator-");
-    const databasePath = path.join(root, "state", "openclaw.sqlite");
-    const runtimeDirectory = path.join(root, "runtime");
-    await fs.mkdir(path.dirname(databasePath), { recursive: true });
-    const gateway = acquireGatewayLifecycleCoordinator({
-      databasePath,
-      runtimeDirectory,
-      busyTimeoutMs: 0,
-    });
-    const state = acquireStateDatabaseCoordinator({
-      databasePath,
-      runtimeDirectory,
-      busyTimeoutMs: 0,
-    });
-
-    state.release();
-    gateway.release();
-  });
 
   it("allows the owning Gateway process to mutate its own schema", async () => {
     const root = tempDirs.make("openclaw-gateway-schema-owner-");

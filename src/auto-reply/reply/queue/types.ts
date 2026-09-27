@@ -5,8 +5,10 @@ import type { AdmittedRunOperatorAuthority } from "../../../agents/admitted-run-
 import type { AutoFallbackPrimaryProbe } from "../../../agents/agent-scope.js";
 import type { ExecToolDefaults } from "../../../agents/bash-tools.js";
 import type { CliSessionBindingFacts } from "../../../agents/cli-runner/types.js";
-import type { RunEmbeddedAgentParams } from "../../../agents/embedded-agent-runner/run/params.js";
-import type { CurrentInboundPromptContext } from "../../../agents/internal-runtime-context.js";
+import type {
+  CurrentInboundPromptContext,
+  RunEmbeddedAgentParams,
+} from "../../../agents/embedded-agent-runner/run/params.js";
 import type { ModelFallbackRouteResolution } from "../../../agents/model-fallback.types.js";
 import type { ScheduledToolPolicyContext } from "../../../agents/scheduled-tool-policy.js";
 import type { TrustedSubagentCompletionHandoff } from "../../../agents/subagents/announce/subagent-announce-handoff.js";
@@ -109,7 +111,11 @@ export function isFollowupRunDeferredError(error: unknown): error is FollowupRun
 }
 
 export type FollowupRun = {
+  /** External-turn eligibility; queued execution refreshes the session-selected profile. */
+  personalBootstrapEligible?: boolean;
   prompt: string;
+  /** Original admitted source; queued execution must not replace it with a backend run ID. */
+  sourceTurnId?: string;
   /** Original operator capability retained by this turn's queue/run lifecycle. */
   operatorAuthority?: AdmittedRunOperatorAuthority;
   /** Latest session to claim without rewriting the queued run before store refresh. */
@@ -155,8 +161,6 @@ export type FollowupRun = {
     predecessor: Promise<boolean>;
     settle: (accepted: boolean) => void;
   };
-  /** Preserves this candidate's position ahead of overflow summaries. */
-  steerAnchor?: true;
   /** Internal marker for the one-shot stranded final recovery retry. */
   strandedReplyRetry?: boolean;
   /** Preserve priority runs when old-item queue overflow eviction runs before drain. */
@@ -190,6 +194,7 @@ export type FollowupRun = {
   /** Chat type for context-aware threading (e.g., DM vs channel). */
   originatingChatType?: string;
   run: {
+    providerReviewAcknowledgment?: import("../../../sessions/provider-review.js").ProviderReviewAcknowledgment;
     agentId: string;
     agentDir: string;
     sessionId: string;
@@ -199,6 +204,7 @@ export type FollowupRun = {
     /** Prepared source delivery ownership; a lost source must not restore host media reads. */
     mediaNormalizationOwner?: "gateway";
     clientCaps?: string[];
+    bootstrapUserProfileId?: string;
     gatewayUiCommandTarget?: GatewayUiCommandTarget;
     toolBindings?: Readonly<Record<string, unknown>>;
     chatType?: ChatType;
