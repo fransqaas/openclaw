@@ -110,11 +110,12 @@ export function resolveRecallEscalationDecision(params: {
   return hasRecallIntent(params.message) ? "recall" : "no-recall-intent";
 }
 
-export type RecallEscalationFallbackReason = "abstain" | "error" | "invalid-result" | "timeout";
+export type RecallEscalationFallbackReason = "abstain" | "invalid-result" | "timeout";
 
 /**
  * Gives an opted-in decider one bounded chance to replace the built-in intent
- * matcher. An overdue, failed, invalid, or abstaining answer keeps the matcher.
+ * matcher. Overdue, invalid, or abstaining answers keep the matcher; rejected
+ * authority and caller cancellation stop the hook instead of starting fallback.
  */
 export async function resolveRecallEscalationDecisionWithDecider(params: {
   mode: ActiveMemoryMode;
@@ -129,13 +130,9 @@ export async function resolveRecallEscalationDecisionWithDecider(params: {
   timeoutMs?: number;
   onDeciderFallback?: (reason: RecallEscalationFallbackReason) => void;
 }): Promise<RecallEscalationDecision> {
+  params.signal.throwIfAborted();
   const builtInDecision = resolveRecallEscalationDecision(params);
-  if (
-    params.mode !== "escalate" ||
-    params.hasStrongLaneOneHit ||
-    !params.decider ||
-    params.signal.aborted
-  ) {
+  if (params.mode !== "escalate" || params.hasStrongLaneOneHit || !params.decider) {
     return builtInDecision;
   }
 
@@ -171,6 +168,7 @@ export async function resolveRecallEscalationDecisionWithDecider(params: {
     // A late rejection after the race has settled must not surface as unhandled.
     decisionPromise.catch(() => {});
     const result = await Promise.race([decisionPromise, abortPromise]);
+    params.signal.throwIfAborted();
     if (result === aborted || signal.aborted || performance.now() >= deadline) {
       timeoutController.abort();
       params.onDeciderFallback?.("timeout");
@@ -187,9 +185,6 @@ export async function resolveRecallEscalationDecisionWithDecider(params: {
       return builtInDecision;
     }
     params.onDeciderFallback?.("invalid-result");
-    return builtInDecision;
-  } catch {
-    params.onDeciderFallback?.("error");
     return builtInDecision;
   } finally {
     clearTimeout(timeout);

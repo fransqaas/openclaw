@@ -1,22 +1,15 @@
-import type { DecisionBatch, DecisionOutcome } from "openclaw/plugin-sdk/decisions";
+import type { DecisionOutcome, DecisionRuntimeV1 } from "openclaw/plugin-sdk/decisions";
 import { expect, it, type Mock } from "vitest";
 import {
   ACTIVE_MEMORY_ESCALATION_DECISION_PURPOSE,
   ACTIVE_MEMORY_ESCALATION_RUBRIC_VERSION,
 } from "./decision-escalation.js";
 
-type EvaluateDecision = (
-  batch: DecisionBatch,
-  options: {
-    agentId?: string;
-    purpose: string;
-    rubricVersion: string;
-    timeoutMs: number;
-    signal: AbortSignal;
-  },
-) => Promise<DecisionOutcome>;
+type EvaluateDecision = DecisionRuntimeV1["evaluate"];
 
 type ActiveMemoryEscalationIntegrationTestHarness = {
+  currentActiveMemoryConfig: () => Record<string, unknown>;
+  expectEmbeddedChannel: (channel: string) => void;
   evaluateDecision: Mock<EvaluateDecision>;
   expectPrependContextContains: (result: unknown, text: string) => void;
   hasDebugLine: (needle: string) => boolean;
@@ -52,7 +45,10 @@ function recallAnswer(probabilityTrue: number): DecisionOutcome {
   };
 }
 
+/** Register escalation coverage against the shared plugin integration harness. */
 export function registerActiveMemoryEscalationIntegrationTests({
+  currentActiveMemoryConfig,
+  expectEmbeddedChannel,
   evaluateDecision,
   expectPrependContextContains,
   hasDebugLine,
@@ -63,6 +59,36 @@ export function registerActiveMemoryEscalationIntegrationTests({
   updateConfigFile,
   skippedRecallContext,
 }: ActiveMemoryEscalationIntegrationTestHarness): void {
+  it.each([
+    [
+      "Russian",
+      "Помнишь, что мы решили вчера?",
+      "Давай обсудим это завтра",
+      "Ты помнишь завтра отправить отчёт?",
+    ],
+  ])(
+    "escalates retrospective %s recall when recall mode is unset",
+    async (_language, prompt, ordinaryPrompt, futurePrompt) => {
+      registerPluginConfig({ mode: undefined });
+      expect(currentActiveMemoryConfig().mode).toBeUndefined();
+      const context = {
+        sessionKey: "agent:main:telegram:direct:owner",
+        messageProvider: "telegram",
+        channelId: "owner",
+      };
+      const ordinary = await runPromptBuild({ prompt: ordinaryPrompt }, context);
+      expectPrependContextContains(ordinary, skippedRecallContext);
+      expect(runEmbeddedAgent).not.toHaveBeenCalled();
+      const future = await runPromptBuild({ prompt: futurePrompt }, context);
+      expectPrependContextContains(future, skippedRecallContext);
+      expect(runEmbeddedAgent).not.toHaveBeenCalled();
+      const recall = await runPromptBuild({ prompt }, context);
+      expect(runEmbeddedAgent).toHaveBeenCalledOnce();
+      expectPrependContextContains(recall, "lemon pepper wings");
+      expectEmbeddedChannel("telegram");
+    },
+  );
+
   const setDecisionAssistance = (enabled: boolean) =>
     updateConfigFile((config) => {
       const agents = (config.agents ?? {}) as Record<string, unknown>;
@@ -155,7 +181,7 @@ export function registerActiveMemoryEscalationIntegrationTests({
     ).toBe(true);
   });
 
-  it("keeps the built-in matcher when the Decision runtime rejects", async () => {
+  it("stops recall when the Decision runtime rejects closed consumer authority", async () => {
     enableDecisionEscalation(recallAnswer(0.1));
     evaluateDecision.mockRejectedValue(new Error("Decision consumer authority closed."));
 
@@ -164,9 +190,9 @@ export function registerActiveMemoryEscalationIntegrationTests({
       operatorContext,
     );
 
-    expect(runEmbeddedAgent).toHaveBeenCalledOnce();
-    expectPrependContextContains(result, "lemon pepper wings");
-    expect(hasDebugLine("active-memory: escalation decision fallback reason=error")).toBe(true);
+    expect(runEmbeddedAgent).not.toHaveBeenCalled();
+    expect(result).toBeUndefined();
+    expect(hasDebugLine("active-memory: escalation decision fallback reason=error")).toBe(false);
   });
 
   it("does not dispatch when Decision assistance is revoked while the runtime prepares", async () => {
@@ -174,11 +200,11 @@ export function registerActiveMemoryEscalationIntegrationTests({
     let dispatched = false;
     evaluateDecision.mockImplementation(async (_batch, options) => {
       setDecisionAssistance(false);
-      // Preparation awaits before the runtime's final pre-dispatch signal check.
-      await new Promise((resolve) => {
-        setTimeout(resolve, 60);
-      });
+      // Simulate the host checking the supplied callback at dispatch.
       options.signal.throwIfAborted();
+      if (!options.admit?.()) {
+        return { status: "unavailable", reason: "disabled" };
+      }
       dispatched = true;
       return recallAnswer(0.1);
     });
@@ -208,10 +234,10 @@ export function registerActiveMemoryEscalationIntegrationTests({
         escalationDecision: true,
         deniedChatIds: ["operator"],
       });
-      await new Promise((resolve) => {
-        setTimeout(resolve, 60);
-      });
       options.signal.throwIfAborted();
+      if (!options.admit?.()) {
+        return { status: "unavailable", reason: "disabled" };
+      }
       dispatched = true;
       return recallAnswer(0.1);
     });
@@ -232,9 +258,6 @@ export function registerActiveMemoryEscalationIntegrationTests({
     evaluateDecision.mockImplementation(async () => {
       // Dispatched already; the opt-in is withdrawn before the skip answer arrives.
       registerPluginConfig({ mode: "escalate" });
-      await new Promise((resolve) => {
-        setTimeout(resolve, 60);
-      });
       return recallAnswer(0.1);
     });
 

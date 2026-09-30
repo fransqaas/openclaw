@@ -249,13 +249,6 @@ describe("active-memory escalation", () => {
   );
 
   it.each([
-    [
-      "throws",
-      async () => {
-        throw new Error("decider failed");
-      },
-      "error",
-    ],
     ["invalid", async () => "invalid" as never, "invalid-result"],
     [
       "times out",
@@ -285,6 +278,38 @@ describe("active-memory escalation", () => {
         }),
       ).resolves.toBe("recall");
       expect(fallbacks).toEqual([expectedReason]);
+    },
+  );
+
+  it.each(["synchronous", "asynchronous", "caller-abort"] as const)(
+    "does not start fallback after %s rejection",
+    async (kind) => {
+      const controller = new AbortController();
+      const error = new Error("Decision consumer authority closed.");
+      const onFallback = vi.fn();
+      await expect(
+        resolveRecallEscalationDecisionWithDecider({
+          mode: "escalate",
+          message: "What did we decide last time?",
+          searchQuery: "earlier decision",
+          hasStrongLaneOneHit: false,
+          signal: controller.signal,
+          onDeciderFallback: onFallback,
+          decider: {
+            decide: () => {
+              if (kind === "caller-abort") {
+                controller.abort(error);
+                return "abstain";
+              }
+              if (kind === "asynchronous") {
+                return Promise.reject(error);
+              }
+              throw error;
+            },
+          },
+        }),
+      ).rejects.toBe(error);
+      expect(onFallback).not.toHaveBeenCalled();
     },
   );
 

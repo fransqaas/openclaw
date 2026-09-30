@@ -122,10 +122,11 @@ describe("active-memory decision escalation", () => {
         purpose: ACTIVE_MEMORY_ESCALATION_DECISION_PURPOSE,
         rubricVersion: ACTIVE_MEMORY_ESCALATION_RUBRIC_VERSION,
         timeoutMs: 750,
-        signal: expect.any(AbortSignal),
+        signal,
+        admit: expect.any(Function),
       },
     );
-    // The runtime receives a consent-fenced signal that still follows the caller.
+    // The host receives the original cancellation signal and live admission callback.
     const passed = (evaluate.mock.calls[0] as unknown[] | undefined)?.[1] as {
       signal: AbortSignal;
     };
@@ -177,149 +178,52 @@ describe("active-memory decision escalation", () => {
   });
 
   describe("live consent fence", () => {
-    const decideRetrospective = (
-      decider: ReturnType<typeof createActiveMemoryDecisionEscalationDecider>,
-    ) =>
-      decider.decide({
-        message: "What did we decide last time?",
-        searchQuery: "What did we decide last time?",
-        signal: new AbortController().signal,
-        timeoutMs: 1_000,
+    it("delegates live dispatch admission to the host without a timer", async () => {
+      let allowed = true;
+      const onAbstain = vi.fn();
+      const evaluate = vi.fn(async (_batch: unknown, options: { admit?: () => boolean }) => {
+        expect(options.admit?.()).toBe(true);
+        allowed = false;
+        expect(options.admit?.()).toBe(false);
+        return { status: "unavailable", reason: "disabled" } as const;
       });
-
-    it("does not dispatch when consent is revoked while the runtime prepares", async () => {
-      vi.useFakeTimers();
-      try {
-        let allowed = true;
-        let dispatched = false;
-        const onAbstain = vi.fn();
-        const evaluate = vi.fn(async (_batch: unknown, options: { signal: AbortSignal }) => {
-          // Operator preparation awaits before the runtime's final pre-dispatch check.
-          await new Promise((resolve) => {
-            setTimeout(resolve, 50);
-          });
-          options.signal.throwIfAborted();
-          dispatched = true;
-          return booleanOutcome(1);
-        });
-        const decider = createActiveMemoryDecisionEscalationDecider({
-          decisions: { evaluate },
-          agentId: "main",
-          isStillAllowed: () => allowed,
-          onAbstain,
-        });
-
-        const pending = decideRetrospective(decider);
-        await vi.advanceTimersByTimeAsync(20);
-        allowed = false;
-        await vi.advanceTimersByTimeAsync(60);
-
-        await expect(pending).resolves.toBe("abstain");
-        expect(evaluate).toHaveBeenCalledOnce();
-        expect(dispatched).toBe(false);
-        expect(onAbstain).toHaveBeenCalledWith("revoked");
-        expect(vi.getTimerCount()).toBe(0);
-      } finally {
-        vi.useRealTimers();
-      }
+      const decider = createActiveMemoryDecisionEscalationDecider({
+        decisions: { evaluate },
+        agentId: "main",
+        isStillAllowed: () => allowed,
+        onAbstain,
+      });
+      expect(
+        await decider.decide({
+          message: "What did we decide last time?",
+          searchQuery: "earlier decision",
+          signal: new AbortController().signal,
+          timeoutMs: 1000,
+        }),
+      ).toBe("abstain");
+      expect(onAbstain).toHaveBeenCalledWith("revoked");
     });
 
-    it("ignores an answer when consent is revoked during inference", async () => {
-      vi.useFakeTimers();
-      try {
-        let allowed = true;
-        const onAbstain = vi.fn();
-        const evaluate = vi.fn(async () => {
-          // Already dispatched; this provider ignores cancellation and still answers.
-          await new Promise((resolve) => {
-            setTimeout(resolve, 50);
-          });
-          return booleanOutcome(1);
-        });
-        const decider = createActiveMemoryDecisionEscalationDecider({
-          decisions: { evaluate },
-          agentId: "main",
-          isStillAllowed: () => allowed,
-          onAbstain,
-        });
-
-        const pending = decideRetrospective(decider);
-        await vi.advanceTimersByTimeAsync(20);
-        allowed = false;
-        await vi.advanceTimersByTimeAsync(60);
-
-        await expect(pending).resolves.toBe("abstain");
-        expect(onAbstain).toHaveBeenCalledWith("revoked");
-        expect(vi.getTimerCount()).toBe(0);
-      } finally {
-        vi.useRealTimers();
-      }
-    });
-
-    it.each([
-      ["the caller aborts", true],
-      ["its budget elapses", false],
-    ] as const)(
-      "stops polling when %s even if the provider never settles",
-      async (_label, abortCaller) => {
-        vi.useFakeTimers();
-        try {
-          const caller = new AbortController();
-          const isStillAllowed = vi.fn(() => true);
-          const decider = createActiveMemoryDecisionEscalationDecider({
-            decisions: { evaluate: () => new Promise<never>(() => {}) },
-            agentId: "main",
-            isStillAllowed,
-          });
-
-          void decider.decide({
-            message: "What did we decide last time?",
-            searchQuery: "What did we decide last time?",
-            signal: caller.signal,
-            timeoutMs: 100,
-          });
-          await vi.advanceTimersByTimeAsync(30);
-          if (abortCaller) {
-            caller.abort();
-          }
-          await vi.advanceTimersByTimeAsync(200);
-          const checks = isStillAllowed.mock.calls.length;
-          await vi.advanceTimersByTimeAsync(1_000);
-
-          expect(isStillAllowed.mock.calls.length).toBe(checks);
-          expect(vi.getTimerCount()).toBe(0);
-        } finally {
-          vi.useRealTimers();
-        }
-      },
-    );
-
-    it("uses the answer and stops polling when consent holds", async () => {
-      vi.useFakeTimers();
-      try {
-        const isStillAllowed = vi.fn(() => true);
-        const decider = createActiveMemoryDecisionEscalationDecider({
-          decisions: {
-            evaluate: async () => {
-              await new Promise((resolve) => {
-                setTimeout(resolve, 50);
-              });
-              return booleanOutcome(0.2);
-            },
+    it("ignores a late answer when consent is withdrawn during inference", async () => {
+      let allowed = true;
+      const decider = createActiveMemoryDecisionEscalationDecider({
+        decisions: {
+          evaluate: async () => {
+            allowed = false;
+            return booleanOutcome(0.1);
           },
-          agentId: "main",
-          isStillAllowed,
-        });
-
-        const pending = decideRetrospective(decider);
-        await vi.advanceTimersByTimeAsync(60);
-
-        await expect(pending).resolves.toBe("skip");
-        expect(isStillAllowed.mock.calls.length).toBeGreaterThan(2);
-        expect(vi.getTimerCount()).toBe(0);
-      } finally {
-        vi.useRealTimers();
-      }
+        },
+        agentId: "main",
+        isStillAllowed: () => allowed,
+      });
+      expect(
+        await decider.decide({
+          message: "What did we decide last time?",
+          searchQuery: "earlier decision",
+          signal: new AbortController().signal,
+          timeoutMs: 1000,
+        }),
+      ).toBe("abstain");
     });
   });
 

@@ -20,8 +20,6 @@ export const ACTIVE_MEMORY_ESCALATION_DECISION_PURPOSE = "active-memory/escalati
 export const ACTIVE_MEMORY_ESCALATION_RUBRIC_VERSION = "active-memory-escalation/1";
 const DEEP_RECALL_QUESTION_ID = "deepRecall";
 const RECALL_PROBABILITY_THRESHOLD = 0.5;
-/** Live-consent recheck cadence while a Decision evaluation is pending. */
-export const ACTIVE_MEMORY_DECISION_CONSENT_POLL_MS = 10;
 
 const DEEP_RECALL_QUESTION = {
   type: "boolean",
@@ -128,18 +126,10 @@ export function mapActiveMemoryEscalationDecisionOutcome(
 export function createActiveMemoryDecisionEscalationDecider(params: {
   decisions: Pick<DecisionRuntimeV1, "evaluate">;
   agentId: string;
-  /**
-   * Reads live consent. It is checked before evaluation, continuously while
-   * the shared runtime prepares and dispatches, and again before the answer is
-   * used, so a revoked opt-in never lets turn evidence reach a hosted Decision
-   * model or lets a late answer steer recall.
-   */
+  /** Reads the current opt-in and turn targeting at the host's effect boundary. */
   isStillAllowed: () => boolean;
   onAbstain?: (reason: ActiveMemoryDecisionAbstainReason) => void;
-  /** Consent poll interval while evaluation is pending. */
-  consentPollMs?: number;
 }): RecallEscalationDecider {
-  const pollMs = params.consentPollMs ?? ACTIVE_MEMORY_DECISION_CONSENT_POLL_MS;
   const revoked = (): "abstain" => {
     params.onAbstain?.("revoked");
     return "abstain";
@@ -149,51 +139,27 @@ export function createActiveMemoryDecisionEscalationDecider(params: {
       if (!params.isStillAllowed()) {
         return revoked();
       }
-      // The runtime checks this signal immediately before provider I/O and
-      // hands it to the provider, so aborting it on revocation fences dispatch.
-      const consent = new AbortController();
-      const poll = setInterval(() => {
-        if (!params.isStillAllowed()) {
-          consent.abort();
-        }
-      }, pollMs);
-      // Polling ends with the decision: when the caller aborts (including its
-      // deadline) or the budget elapses, even if a provider never settles.
-      const stopPolling = () => clearInterval(poll);
-      const pollDeadline = setTimeout(stopPolling, timeoutMs);
-      signal.addEventListener("abort", stopPolling, { once: true });
-      try {
-        let outcome: DecisionOutcome;
-        try {
-          outcome = await params.decisions.evaluate(
-            buildActiveMemoryEscalationDecisionBatch({ message, searchQuery }),
-            {
-              agentId: params.agentId,
-              purpose: ACTIVE_MEMORY_ESCALATION_DECISION_PURPOSE,
-              rubricVersion: ACTIVE_MEMORY_ESCALATION_RUBRIC_VERSION,
-              timeoutMs,
-              signal: AbortSignal.any([signal, consent.signal]),
-            },
-          );
-        } catch (error) {
-          if (consent.signal.aborted) {
-            return revoked();
-          }
-          throw error;
-        }
-        if (consent.signal.aborted || !params.isStillAllowed()) {
-          return revoked();
-        }
-        const mapped = mapActiveMemoryEscalationDecisionOutcome(outcome);
-        if (mapped.result === "abstain") {
-          params.onAbstain?.(mapped.reason);
-        }
-        return mapped.result;
-      } finally {
-        stopPolling();
-        clearTimeout(pollDeadline);
-        signal.removeEventListener("abort", stopPolling);
+      // The host owns dispatch admission through provider/network preparation.
+      // Keep the consumer check before use as well: an answer grants no authority.
+      const outcome = await params.decisions.evaluate(
+        buildActiveMemoryEscalationDecisionBatch({ message, searchQuery }),
+        {
+          agentId: params.agentId,
+          purpose: ACTIVE_MEMORY_ESCALATION_DECISION_PURPOSE,
+          rubricVersion: ACTIVE_MEMORY_ESCALATION_RUBRIC_VERSION,
+          timeoutMs,
+          signal,
+          admit: params.isStillAllowed,
+        },
+      );
+      if (!params.isStillAllowed()) {
+        return revoked();
       }
+      const mapped = mapActiveMemoryEscalationDecisionOutcome(outcome);
+      if (mapped.result === "abstain") {
+        params.onAbstain?.(mapped.reason);
+      }
+      return mapped.result;
     },
   };
 }
