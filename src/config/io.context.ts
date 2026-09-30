@@ -1,5 +1,3 @@
-import crypto from "node:crypto";
-import { ensureOwnerDisplaySecret } from "../agents/owner-display.js";
 import {
   readDeferredPluginMigrations,
   readDeferredPluginMigrationsAsync,
@@ -13,7 +11,6 @@ import {
 } from "../infra/shell-env.js";
 import { withPluginMetadataSnapshotScope } from "../plugins/current-plugin-metadata-snapshot.js";
 import { loadInstalledPluginIndexInstallRecords } from "../plugins/installed-plugin-index-record-reader.js";
-import type { PluginManifestRegistry } from "../plugins/manifest-registry.js";
 import { getPluginMetadataSnapshotCache, withPluginCache } from "../plugins/plugin-cache.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
 import { withSynchronousArtifactPreservingStateSnapshot } from "../state/openclaw-state-db-readonly.js";
@@ -22,7 +19,6 @@ import { applyConfigEnvVars, cloneEnvWithPlatformSemantics } from "./config-env-
 import { ConfigIncludeError, ConfigIncludeReadError } from "./includes.js";
 import { isInvalidConfigError } from "./io.invalid-config.js";
 import { observeConfigSnapshot, observeConfigSnapshotSync } from "./io.observe.js";
-import { retainGeneratedOwnerDisplaySecret } from "./io.owner-display-secret.js";
 import {
   resolveConfigWidePluginMetadataSnapshot,
   resolveConfigWidePluginMetadataSnapshotAsync,
@@ -34,7 +30,6 @@ import {
   resolveConfigIncludesForRead,
   resolveConfigPathForDeps,
 } from "./io.read-helpers.js";
-import { autoOwnerDisplaySecretByPath } from "./io.state.js";
 import type {
   ConfigIoFactoryOptions,
   ConfigRecoveryCandidate,
@@ -52,9 +47,10 @@ import {
   validateConfigObjectWithPlugins,
   validateConfigObjectWithPluginsAsync,
 } from "./validation.js";
-import type { PreparedConfigValidationPluginMetadata } from "./validation.types.js";
-
-type ValidateConfigWithPluginsResult = ReturnType<typeof validateConfigObjectWithPlugins>;
+import type {
+  PreparedConfigValidationPluginMetadata,
+  ValidateConfigWithPluginsResult,
+} from "./validation.types.js";
 
 type RecoveryCandidateValidation = {
   authoredCandidate: unknown;
@@ -72,7 +68,6 @@ export type ConfigRecoveryCandidateTransform = (params: {
 type ValidationPluginMetadataSnapshotLoader = {
   load: (config: OpenClawConfig) => Pick<PluginMetadataSnapshot, "manifestRegistry">;
   loadAsync: (config: OpenClawConfig) => Promise<PreparedConfigValidationPluginMetadata>;
-  getManifestRegistry: () => PluginManifestRegistry | undefined;
   getSnapshot: () => PluginMetadataSnapshot | undefined;
 };
 
@@ -177,19 +172,7 @@ export function createConfigIoContext(
         timeoutMs: cfg.env?.shellEnv?.timeoutMs ?? resolveShellEnvFallbackTimeoutMs(deps.env),
       });
     }
-    const pendingValue = autoOwnerDisplaySecretByPath.get(configPath);
-    const { config: resolvedConfig, generatedSecret } = ensureOwnerDisplaySecret(
-      cfg,
-      () => pendingValue ?? crypto.randomBytes(32).toString("hex"),
-    );
-    const finalized = applyConfigOverrides(
-      retainGeneratedOwnerDisplaySecret({
-        config: resolvedConfig,
-        configPath,
-        generatedSecret,
-        state: { pendingByPath: autoOwnerDisplaySecretByPath },
-      }),
-    );
+    const finalized = applyConfigOverrides(cfg);
     const inherited = inheritLegacyDefaultAgentId(cfg, finalized);
     copyConfigResolutionFacts(cfg, inherited);
     return inherited;
@@ -225,7 +208,6 @@ export function createConfigIoContext(
             installedPluginRecordIds: new Set(Object.keys(records)),
           };
         })()),
-      getManifestRegistry: () => snapshot?.manifestRegistry,
       getSnapshot: () => snapshot,
     };
   }
