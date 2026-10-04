@@ -103,6 +103,14 @@ describe("terminal resolution for a tool call rejected before dispatch", () => {
 
   it.each([
     {
+      name: "no tool ran before the rejection",
+      overrides: {
+        toolMetas: [],
+        itemLifecycle: { startedCount: 0, completedCount: 0, activeCount: 0 },
+      },
+      assistant: {},
+    },
+    {
       name: "a tool is still running",
       overrides: { itemLifecycle: { startedCount: 1, completedCount: 0, activeCount: 1 } },
       assistant: {},

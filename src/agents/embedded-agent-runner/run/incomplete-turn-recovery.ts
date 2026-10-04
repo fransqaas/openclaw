@@ -414,6 +414,7 @@ export function resolveEmptyResponseRetryInstruction(params: {
   // Error turns are never silent replies, so this checks model output directly:
   // the only payload such a turn can produce is the host's own failure notice.
   const rejectedBeforeDispatch =
+    params.attempt.itemLifecycle.completedCount > 0 &&
     assistantState.visibleText.length === 0 &&
     !params.attempt.hasToolMediaBlockReply &&
     resolveSourceReplyDelivery(params.attempt) === "missing" &&
