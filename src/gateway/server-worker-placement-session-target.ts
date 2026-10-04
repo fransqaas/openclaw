@@ -78,14 +78,6 @@ export function createWorkerWorkspaceRecoveryPreparer(options: {
     const completion = createDeferredCore();
     const controller = new AbortController();
     let unregister = () => {};
-    const release = () => {
-      if (released) {
-        return;
-      }
-      released = true;
-      unregister();
-      retained.claim.release();
-    };
     const assertSourceCurrent = () => {
       controller.signal.throwIfAborted();
       assertOwnerCurrent();
@@ -147,7 +139,9 @@ export function createWorkerWorkspaceRecoveryPreparer(options: {
         }),
       );
     } finally {
-      release();
+      released = true;
+      unregister();
+      retained.claim.release();
       completion.resolve();
     }
   };
@@ -166,7 +160,7 @@ export async function runWorkerPlacementSessionBarrier<T>(params: {
   executionMode: WorkerPlacementExecutionMode;
   action: "activation" | "recovery";
   signal?: AbortSignal;
-  run: (workspace: WorkerSessionWorkspace) => T | Promise<T>;
+  run: (workspace: WorkerSessionWorkspace, assertCurrent: () => void) => T | Promise<T>;
 }): Promise<T> {
   const target = params.sessionRuntime.resolveGatewaySessionStoreTargetWithStore({
     cfg: params.getConfig(),
@@ -183,7 +177,6 @@ export async function runWorkerPlacementSessionBarrier<T>(params: {
     signal: params.signal,
     run: async () => {
       const {
-        config,
         target: currentTarget,
         entry,
         workspace,
@@ -204,21 +197,27 @@ export async function runWorkerPlacementSessionBarrier<T>(params: {
           `Session ${params.sessionKey} was archived before cloud worker ${params.action}. Retry.`,
         );
       }
-      const currentRuntime = params.sessionRuntime.resolveWorkerPlacementSessionRuntime({
-        cfg: config,
-        entry,
-        agentId: currentTarget.agentId,
-        sessionKey: currentTarget.canonicalKey,
-      });
-      if (
-        params.sessionRuntime.resolveWorkerPlacementExecutionMode(currentRuntime) !==
-        params.executionMode
-      ) {
-        throw new WorkerDispatchTargetChangedError(
-          `Session ${params.sessionKey} runtime changed to ${currentRuntime} before cloud worker ${params.action}. Retry.`,
-        );
-      }
-      return await params.run(workspace);
+      const assertPlacementCurrent = () => {
+        params.signal?.throwIfAborted();
+        const config = params.getConfig();
+        assertCurrent(config);
+        const currentRuntime = params.sessionRuntime.resolveWorkerPlacementSessionRuntime({
+          cfg: config,
+          entry,
+          agentId: currentTarget.agentId,
+          sessionKey: currentTarget.canonicalKey,
+        });
+        if (
+          params.sessionRuntime.resolveWorkerPlacementExecutionMode(currentRuntime) !==
+          params.executionMode
+        ) {
+          throw new WorkerDispatchTargetChangedError(
+            `Session ${params.sessionKey} runtime changed to ${currentRuntime} before cloud worker ${params.action}. Retry.`,
+          );
+        }
+      };
+      assertPlacementCurrent();
+      return await params.run(workspace, assertPlacementCurrent);
     },
   });
 }
@@ -233,14 +232,16 @@ export async function resolveWorkerPlacementSessionTarget(params: {
   expectedTarget?: ReturnType<typeof sessionUtils.resolveGatewaySessionStoreTargetWithStore>;
   errorMessage: string;
 }) {
-  const initialTarget = params.sessionRuntime.resolveGatewaySessionStoreTargetWithStore({
-    cfg: params.config,
-    key: params.sessionKey,
-    agentId: params.agentId,
-    preserveQualifiedAddress: true,
-    clone: false,
-    exactRead: true,
-  });
+  const resolveTarget = (cfg: OpenClawConfig) =>
+    params.sessionRuntime.resolveGatewaySessionStoreTargetWithStore({
+      cfg,
+      key: params.sessionKey,
+      agentId: params.agentId,
+      preserveQualifiedAddress: true,
+      clone: false,
+      exactRead: true,
+    });
+  const initialTarget = resolveTarget(params.config);
   const initialEntry = params.sessionRuntime.resolveCanonicalSessionEntryFromStoreKeys(
     initialTarget.store,
     initialTarget.storeKeys,
@@ -269,14 +270,7 @@ export async function resolveWorkerPlacementSessionTarget(params: {
     ? await getSessionRepositoryWorkspaceStore().prepare(initialIdentity.repositoryWorkspaceId)
     : undefined;
   const resolveBinding = (config = params.config) => {
-    const target = params.sessionRuntime.resolveGatewaySessionStoreTargetWithStore({
-      cfg: config,
-      key: params.sessionKey,
-      agentId: params.agentId,
-      preserveQualifiedAddress: true,
-      clone: false,
-      exactRead: true,
-    });
+    const target = resolveTarget(config);
     const entry = params.sessionRuntime.resolveCanonicalSessionEntryFromStoreKeys(
       target.store,
       target.storeKeys,

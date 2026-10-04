@@ -71,6 +71,15 @@ openclaw plugins disable workboard
 
 ## Board appearance
 
+While Workboard is open, its sidebar entry expands to show both Cards and
+Sessions boards, with the open board highlighted. Select a nested board to open it.
+Sidebar labels use the board name; boards with the same name include their kind
+in parentheses, such as **Planning (cards)** and **Planning (sessions)**.
+Boards you create in the Control UI are pinned in the sidebar immediately.
+Use **Customize** to pin any other board or remove a pin; removed pins stay removed.
+Pinned boards remain available as top-level entries when you leave Workboard,
+and you can drag them to reorder them.
+
 Choose **New board**, then **Cards** (the default) or **Sessions**. A Sessions
 board starts with the columns described below. A board's kind is permanent;
 create another board to use the other kind. Existing boards remain Cards boards.
@@ -234,6 +243,14 @@ one follow-up read. Workboard defers that read while a card is being dragged,
 edited, or written, then resumes after the local interaction finishes. A
 reconnect always performs a canonical reload. There is no routine full-card
 poll, and **Refresh** remains available as manual recovery.
+
+The Gateway shares one immutable `workboard.cards.list` payload per normalized
+board filter at each store revision, including concurrent reads. Card and board
+writes invalidate it before the next read; the existing change service also
+invalidates it when it observes a commit from another SQLite connection.
+Each response still includes all board summaries, so a change to another board
+invalidates the payload too. Claim tokens remain redacted, and the RPC response
+shape is unchanged.
 
 When more than one board exists, the toolbar includes a **Board** filter backed
 by persisted board metadata rather than only the currently visible cards. Empty

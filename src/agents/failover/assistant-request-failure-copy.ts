@@ -10,6 +10,7 @@ import { isContextOverflowErrorFromTables } from "./context-overflow-tables.js";
 import {
   isServerErrorMessage,
   isSessionTranscriptValidationErrorMessage,
+  resolveExecutionApprovalFailureMessage,
 } from "./message-patterns.js";
 import { extractFailoverSignalDetails } from "./signal-details.js";
 import type { FailoverReason } from "./signal.js";
@@ -129,13 +130,10 @@ export function renderFormatErrorCopy(raw: string): string {
   if (isSessionTranscriptValidationErrorMessage(candidate)) {
     return GATEWAY_SESSION_TRANSCRIPT_VALIDATION_USER_TEXT;
   }
-  const cacheLimit = candidate.match(PROVIDER_CACHE_CONTROL_LIMIT_RE);
-  if (cacheLimit) {
+  if (PROVIDER_CACHE_CONTROL_LIMIT_RE.test(candidate)) {
     return "The AI service couldn't accept this conversation. Start a new conversation with /new, or choose another model in the Control UI.";
   }
-  const match = candidate.length <= 300 ? candidate.match(PROVIDER_OUTPUT_TOKEN_LIMIT_RE) : null;
-  const [, value, maximum] = match ?? [];
-  if (!value || !maximum) {
+  if (candidate.length > 300 || !PROVIDER_OUTPUT_TOKEN_LIMIT_RE.test(candidate)) {
     return PROVIDER_SCHEMA_REJECTION_USER_TEXT;
   }
   return "The reply length is set too high for this model. Lower its reply limit in the Control UI settings, or choose another model.";
@@ -174,6 +172,12 @@ export function renderRecordedAssistantFailureCopy(message: {
   errorCode?: unknown;
   errorType?: unknown;
 }): string | undefined {
+  const approvalMessage = resolveExecutionApprovalFailureMessage(
+    typeof message.errorMessage === "string" ? message.errorMessage : undefined,
+  );
+  if (approvalMessage) {
+    return `⚠️ ${approvalMessage}`;
+  }
   const formatCopy = renderAssistantFormatFailureCopy(message);
   if (formatCopy) {
     return formatCopy;

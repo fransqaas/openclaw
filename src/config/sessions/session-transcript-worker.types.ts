@@ -1,3 +1,4 @@
+import type { Result } from "@openclaw/normalization-core/result";
 import type { ProgressCard } from "../../../packages/gateway-protocol/src/index.js";
 import type {
   BuildSessionEntryOptions,
@@ -56,6 +57,7 @@ import type {
   readSessionTranscriptModelContext,
   SessionModelContextLimits,
 } from "./session-accessor.sqlite-model-context.js";
+import type { SessionParticipantRecord } from "./session-accessor.sqlite-participant-projection.js";
 import type { listSessionPendingInputReceipts } from "./session-accessor.sqlite-pending-input-receipts.js";
 import type { SessionTranscriptMessageEvent } from "./session-accessor.sqlite-projection-read.js";
 import type {
@@ -86,6 +88,8 @@ import type {
 } from "./session-entry-read.types.js";
 import type { PublishedSessionTranscriptArchive } from "./session-history-archive-pruning.types.js";
 import type {
+  ChatHistoryDisplayRequest,
+  ChatHistoryDisplayResult,
   SessionHistoryWorkerRequest,
   SessionHistoryWorkerResult,
   SessionHistoryDelta,
@@ -95,6 +99,7 @@ import type {
   PendingInputHistoryWorkerInput,
   PendingInputHistorySnapshot,
 } from "./session-pending-input-history.types.js";
+import type * as PendingInputSourceWorker from "./session-pending-input-source.types.js";
 import type {
   SessionMembersWorkerInput,
   SessionMembershipFactsWorkerInput,
@@ -368,10 +373,7 @@ export type SessionExactEntriesWorkerResult = {
     birthtime?: string;
   };
   members?: Record<string, SessionMember[]>;
-  participantRecords?: Record<
-    string,
-    import("./session-accessor.sqlite-participant-projection.js").SessionParticipantRecord[]
-  >;
+  participantRecords?: Record<string, SessionParticipantRecord[]>;
   replacement?: SessionEntryReplacementState & { databaseIdentity: string };
   creation?: import("./session-accessor.sqlite-creation-read.js").SessionCreationSnapshot & {
     databaseIdentity: string;
@@ -442,6 +444,7 @@ type SessionArchivedEvictionCandidatesWorkerInput = Omit<
 > & { archived: ArchivedSessionEvictionQuery };
 
 export type SessionHistoryWorkerInput =
+  | { kind: "cli-process-history"; request: ChatHistoryDisplayRequest }
   | LifecycleArtifactCleanupRequest
   | { kind: "prewarm"; database: { agentId: string; path: string }; env: NodeJS.ProcessEnv }
   | SessionHistoricalEvictionCandidatesWorkerInput
@@ -470,6 +473,7 @@ export type SessionHistoryWorkerInput =
   | SessionProgressCardWorkerInput
   | PendingInputHistoryWorkerInput
   | SessionPendingInputReceiptsWorkerInput
+  | PendingInputSourceWorker.Input
   | SessionGoalOperationReceiptWorkerInput
   | ConversationRowsWorkerInput
   | ConversationDeliveryWorkerInput
@@ -503,6 +507,7 @@ export type SessionHistoryWorkerPreparedInput =
   PreparedHistoryInput<SessionHistoryDatabaseWorkerInput>;
 
 export type SessionTranscriptWorkerValues = SessionTranscriptInventoryWorkerValues & {
+  "cli-process-history": ChatHistoryDisplayResult;
   "conversation-rows": { kind: "conversation-rows"; rows: ConversationRecord[] };
   "conversation-delivery": { kind: "conversation-delivery"; record?: ConversationDeliveryRecord };
   prewarm: { kind: "prewarm" };
@@ -554,6 +559,7 @@ export type SessionTranscriptWorkerValues = SessionTranscriptInventoryWorkerValu
     kind: "goal-operation-receipt";
     result: SessionGoalOperationLookupResult;
   };
+  "session-pending-input-source": PendingInputSourceWorker.Value;
   "session-pending-input-history": {
     kind: "session-pending-input-history";
     snapshot: PendingInputHistorySnapshot;
@@ -711,10 +717,7 @@ export type SessionHistoryWorkerDatabase = SessionTranscriptInventoryReaders & {
   >;
   readEntryResult: SessionHistoryReader<
     SessionEntryReadWorkerInput,
-    import("@openclaw/normalization-core/result").Result<
-      SessionEntryReadWorkerResult["entry"],
-      unknown
-    >
+    Result<SessionEntryReadWorkerResult["entry"], unknown>
   >;
   readEntryCurrent: SessionHistoryReader<
     SessionEntryCurrentWorkerInput,
@@ -733,6 +736,7 @@ export type SessionHistoryWorkerDatabase = SessionTranscriptInventoryReaders & {
     SessionGoalOperationReceiptWorkerInput,
     SessionGoalOperationLookupResult
   >;
+  readPendingInputSource: PendingInputSourceWorker.Reader;
   readPendingInputHistory: SessionHistoryReader<
     PendingInputHistoryWorkerInput,
     PendingInputHistorySnapshot

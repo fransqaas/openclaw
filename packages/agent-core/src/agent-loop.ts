@@ -1,12 +1,8 @@
 import type { AssistantMessage, ToolResultMessage } from "@openclaw/llm-core";
 import { coerceErrorMessage } from "@openclaw/normalization-core/error-coercion";
+import { createStreamedSteeringConfig, getSteeringAtCheckpoint } from "./agent-loop-steering.js";
 import {
-  createStreamedSteeringConfig,
-  createToolPlanState,
-  getSteeringAtCheckpoint,
-  type ToolPlanState,
-} from "./agent-loop-steering.js";
-import {
+  emitToolResultMessage,
   streamAgentResponse,
   type AgentEventSink,
   type AsyncToolBatchScheduling,
@@ -40,12 +36,7 @@ import {
   createFailureMessage,
   isTurnHandoffAbort,
 } from "./turn-interruption.js";
-import {
-  isActiveTurnTainted,
-  toolResultTaintsTurn,
-  withAssistantTurnTaint,
-  withToolResultContentSource,
-} from "./turn-taint.js";
+import { isActiveTurnTainted, toolResultTaintsTurn, withAssistantTurnTaint } from "./turn-taint.js";
 import type {
   ToolResultContentSource,
   AgentContext,
@@ -72,6 +63,8 @@ const TOOL_ADMISSION_FAILURE_DETAILS = {
   status: "blocked",
   deniedReason: "tool-admission",
 } as const;
+
+type ToolPlanState = { executionStarted: boolean };
 
 /** Run a prompt-started loop and emit events through a caller-owned sink. */
 export async function runAgentLoop(
@@ -119,11 +112,6 @@ export async function runAgentLoopContinue(
   streamFn?: StreamFn,
   runtime?: AgentCoreStreamRuntimeDeps,
 ): Promise<AgentMessage[]> {
-  assertContinuableContext(context);
-  return runAgentLoop([], context, config, emit, signal, streamFn, runtime);
-}
-
-function assertContinuableContext(context: AgentContext): void {
   const lastMessage = context.messages.at(-1);
   if (!lastMessage) {
     throw new Error("Cannot continue: no messages in context");
@@ -131,6 +119,7 @@ function assertContinuableContext(context: AgentContext): void {
   if (lastMessage.role === "assistant") {
     throw new TranscriptNotContinuableError(lastMessage.role);
   }
+  return runAgentLoop([], context, config, emit, signal, streamFn, runtime);
 }
 
 /**
@@ -264,7 +253,7 @@ async function runLoop(
         }
       }
 
-      const toolPlan = createToolPlanState();
+      const toolPlan: ToolPlanState = { executionStarted: false };
       const streamedSteering = createStreamedSteeringConfig(config);
       const streamed = await streamAgentResponse(
         state.context,
@@ -905,20 +894,6 @@ function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): b
   );
 }
 
-function prepareToolCallArguments(tool: AgentTool, toolCall: AgentToolCall): AgentToolCall {
-  if (!tool.prepareArguments) {
-    return toolCall;
-  }
-  const preparedArguments = tool.prepareArguments(toolCall.arguments);
-  if (preparedArguments === toolCall.arguments) {
-    return toolCall;
-  }
-  return {
-    ...toolCall,
-    arguments: preparedArguments as Record<string, unknown>,
-  };
-}
-
 async function resolveToolCallTool(
   batch: ToolBatchContext,
   toolCall: AgentToolCall,
@@ -1019,7 +994,13 @@ async function validateToolCallForBatchAdmission(
 
   let preparedToolCall: AgentToolCall;
   try {
-    preparedToolCall = prepareToolCallArguments(tool, toolCall);
+    const preparedArguments = tool.prepareArguments
+      ? tool.prepareArguments(toolCall.arguments)
+      : toolCall.arguments;
+    preparedToolCall =
+      preparedArguments === toolCall.arguments
+        ? toolCall
+        : { ...toolCall, arguments: preparedArguments as Record<string, unknown> };
   } catch (error) {
     return immediateToolCallError(coerceErrorMessage(error));
   }
@@ -1464,30 +1445,6 @@ async function emitToolExecutionEnd(
     ...(finalized.errorKind ? { errorKind: finalized.errorKind } : {}),
     ...(finalized.hideFromChannelProgress === true ? { hideFromChannelProgress: true } : {}),
   });
-}
-
-async function emitToolResultMessage(
-  finalized: FinalizedToolCallOutcome,
-  emit: AgentEventSink,
-): Promise<ToolResultMessage> {
-  const message = copyInternalToolResultState(
-    finalized.result,
-    withToolResultContentSource(
-      {
-        role: "toolResult",
-        toolCallId: finalized.toolCall.id,
-        toolName: finalized.toolCall.name,
-        content: finalized.result.content ?? [],
-        details: finalized.result.details,
-        isError: finalized.isError,
-        timestamp: Date.now(),
-      },
-      finalized.resultContentSource,
-    ),
-  );
-  await emit({ type: "message_start", message });
-  await emit({ type: "message_end", message });
-  return message;
 }
 
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

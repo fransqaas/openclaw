@@ -19,14 +19,16 @@ import {
   type ChatDisplayProjectionOptions,
 } from "./chat-display-projection.core.js";
 import { DEFAULT_CHAT_HISTORY_TEXT_MAX_CHARS } from "./chat-display-projection.helpers.js";
-import type { SubagentCoordinationDisplayResolver } from "./chat-display-projection.history.js";
 import type { CurrentUserProfileDisplayResolver } from "./current-user-profile-display.js";
 import { getMaxChatHistoryMessagesBytes } from "./server-constants.js";
 import {
   readChatHistoryMessageSeq as resolveMessageSeq,
   readIncrementalChatHistoryTail,
 } from "./session-history-tail.js";
-import type { SessionTranscriptReader } from "./session-transcript-read-kernel.js";
+import type {
+  SessionTranscriptReader,
+  SubagentCoordinationDisplayResolver,
+} from "./session-transcript-read.types.js";
 
 type SessionHistorySnapshotOptions = {
   readers: SessionTranscriptReader;
@@ -184,6 +186,28 @@ function paginateSessionMessages(
   });
 }
 
+/** Retain the actor across lazy adapter loading without expanding shared execution imports. */
+export function createIncognitoSessionComputeReader(
+  params: Parameters<
+    typeof import("../config/sessions/session-incognito-compute-read.js").bindIncognitoSessionComputeReader
+  >[0],
+) {
+  const { actor, authority, signal } = params;
+  const target = structuredClone(params.target);
+  signal?.throwIfAborted();
+  return actor.sessions.withCompute(
+    authority,
+    target,
+    async () => {
+      const { bindIncognitoSessionComputeReader } =
+        await import("../config/sessions/session-incognito-compute-read.js");
+      signal?.throwIfAborted();
+      return bindIncognitoSessionComputeReader({ actor, authority, target, signal });
+    },
+    signal,
+  );
+}
+
 /** Inactive composition: callers retain the actor and supply already-prepared display facts. */
 export function createIncognitoSessionHistoryReader(params: {
   actor: Pick<IncognitoAgentDatabaseExecution, "sessions" | "assertCurrent">;
@@ -243,8 +267,22 @@ export function createIncognitoSessionHistoryReader(params: {
       read(scope, { type: "session.history.page", input: { ...target, options } }),
     readSessionMessagesAroundIdWithStatsAsync: (scope, options) =>
       read(scope, { type: "session.history.around-id", input: { ...target, options } }),
-    readSessionMessageByIdAsync: (scope, messageId, options) =>
-      read(scope, { type: "session.history.by-id", input: { ...target, messageId, options } }),
+    readSessionMessageByIdAsync: async (scope, messageId, options) => {
+      const { filterSessionMessageHistoryVisibility } =
+        await import("./session-transcript-read-kernel.js");
+      return disclose(
+        await filterSessionMessageHistoryVisibility(
+          await read(scope, {
+            type: "session.history.by-id",
+            input: { ...target, messageId, options },
+          }),
+          scope,
+          messageId,
+          options?.historyVisibility,
+          readers,
+        ),
+      );
+    },
     async readSessionMessagesWithSourceAsync(scope, options) {
       const { messages, offPathMessages, transcriptPath } = await read(scope, {
         type: "session.history.source",
