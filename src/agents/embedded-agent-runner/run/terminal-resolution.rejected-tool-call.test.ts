@@ -8,6 +8,7 @@ import { resolveEmbeddedRunTerminal } from "./terminal-resolution.js";
 import { makeTerminalInput, type TerminalInput } from "./terminal-resolution.test-support.js";
 import { createEmbeddedRunTerminalRetryState } from "./terminal-retry-state.js";
 
+// mock-isolation: terminal recovery must not update persistent auth-profile state.
 vi.mock("./auth-profile-success.js", () => ({
   markEmbeddedRunAuthProfileSuccess: vi.fn(),
   reportEmbeddedRunSuccessfulAuthBinding: vi.fn(),
@@ -63,7 +64,9 @@ describe("terminal resolution for a tool call rejected before dispatch", () => {
     const activateInternalPrompt = vi.fn();
 
     await expect(
-      resolveEmbeddedRunTerminal(makeTerminalInput({ ...turn, activateInternalPrompt })),
+      resolveEmbeddedRunTerminal(
+        makeTerminalInput({ ...turn, sessionPromptState: { activateInternalPrompt } }),
+      ),
     ).resolves.toEqual({ action: "retry" });
     expect(activateInternalPrompt).toHaveBeenCalledOnce();
     const instruction = activateInternalPrompt.mock.calls[0]?.[0] as string;
@@ -95,7 +98,7 @@ describe("terminal resolution for a tool call rejected before dispatch", () => {
               errorCode: "malformed_tool_call_arguments",
             },
           ),
-          activateInternalPrompt,
+          sessionPromptState: { activateInternalPrompt },
         }),
       ),
     ).resolves.toEqual({ action: "retry" });
@@ -151,7 +154,7 @@ describe("terminal resolution for a tool call rejected before dispatch", () => {
     const result = await resolveEmbeddedRunTerminal(
       makeTerminalInput({
         ...rejectedCallAfterSettledTool(overrides, assistant),
-        activateInternalPrompt,
+        sessionPromptState: { activateInternalPrompt },
       }),
     );
 
