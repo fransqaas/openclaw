@@ -198,7 +198,8 @@ type PluginToolApprovalParams = {
 async function requestPluginToolApproval(params: PluginToolApprovalParams): Promise<HookOutcome> {
   const deadlineAtMs =
     Date.now() +
-    resolvePluginToolApprovalGatewayTimeoutMs(resolvePluginToolApprovalTimeoutMs(params.approval));
+    (addTimerTimeoutGraceMs(resolvePluginToolApprovalTimeoutMs(params.approval), 10_000) ??
+      DEFAULT_PLUGIN_APPROVAL_TIMEOUT_MS + 10_000);
   let pending = true;
   let resolved = false;
   const release = params.ctx?.runId
