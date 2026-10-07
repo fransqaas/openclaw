@@ -27,6 +27,7 @@ import {
 } from "./tools/gateway-caller-context.js";
 import { callGatewayTool } from "./tools/gateway.js";
 
+// mock-isolation: No Gateway runs here; each case scripts the approval RPCs to control timing.
 vi.mock("./tools/gateway.js", () => ({
   callGatewayTool: vi.fn(),
 }));
@@ -94,11 +95,19 @@ function requestApproval(timeoutMs: number, signal?: AbortSignal) {
       // Like the real client, the wait rejects as soon as the run's signal aborts.
       const waitSignal = (extra as { signal?: AbortSignal } | undefined)?.signal;
       return await new Promise((resolve, reject) => {
-        waitSignal?.addEventListener("abort", () => reject(waitSignal.reason), { once: true });
+        waitSignal?.addEventListener(
+          "abort",
+          () => {
+            // Keep the signal's own reason: the hook recognizes cancellation by identity.
+            const reason: unknown = waitSignal.reason;
+            reject(reason instanceof Error ? reason : new Error(String(reason)));
+          },
+          { once: true },
+        );
         void decision.promise.then(resolve);
       });
     }
-    throw new Error(`unexpected gateway method ${String(method)}`);
+    throw new Error(`unexpected gateway method ${method}`);
   });
   const outcome = resolveBeforeToolCallApprovalOutcome({
     result: {
