@@ -32,6 +32,22 @@ replacement. Choose an empty `OPENCLAW_GIT_DIR` and retry.
 
 ### Validation and activation
 
+On Windows, candidate commands verify their recorded handoff lease and their own
+PID/start identity even when the launcher process tree changes. A different
+immediate parent no longer causes a valid candidate to fail with `Candidate
+executor binding does not match its parent`. The update owner must remain live,
+and changed or revoked leases still refuse mutation. This check runs in the
+candidate, so it also accepts valid handoffs from older installed updaters.
+
+Channel health collection timeouts are warnings during post-update verification.
+The Gateway must still answer, report the expected version and build, pass HTTP
+readiness, and remain in the same running generation. An explicit negative channel
+probe still fails verification. Timeout warnings remain in the update report even
+if a later probe completes; run `openclaw health` to check the affected channels.
+The seven-second collection budget is unchanged. Updated Gateways also avoid
+reporting collection timeouts as negative probes to older updaters, although those
+updaters cannot add the new warning to their update reports.
+
 If the resolved registry package version equals the installed version without changing the selected channel or installation method, or the Git target SHA equals `HEAD` and the installed runtime passes artifact verification, plugin convergence still runs; if plugins and runtime artifacts remain unchanged, the run finishes `skipped` with reason `already-current`.
 Runtime maintenance can therefore succeed without changing the Git revision.
 A same-version explicit `--channel` or installation-method change finishes successfully.
@@ -216,9 +232,18 @@ with a verified backup and the managed Gateway stopped during replacement.
 
 Interrupting a fresh local update before activation records a failed,
 `interrupted` history entry while its installation owner is still held.
-An interrupted update is not a successful update or a verified rollback.
+A pre-activation interruption is not a successful update or a verified rollback.
 Unresolved effects remain visible in the update report. Unsupported pending
 checkpoint records block further mutable update work and remain unchanged.
+
+During activation or verification, SIGINT, SIGTERM, and SIGHUP stop forward work
+and retain the updater until its existing recovery owner has attempted to restore
+the Gateway and write the failure report. Recovery uses the update's existing
+budget and package/state safety checks. The report names the interrupted phase
+and signal; use `openclaw update status` and, if recovery remains pending,
+`openclaw update repair`. This requires the fix in the installed updater; a new
+candidate cannot change an older driver's signal handling. SIGKILL cannot run
+this cleanup and still requires explicit recovery.
 
 After the target Doctor migrates shared state, the installed target runtime owns
 database validation, service finalization, and update-history writes, including
@@ -238,6 +263,18 @@ host links target the staged installation. Literal imports, `require()` calls, a
 literal dynamic imports to shared source modules include those modules and their
 package metadata in the private copy. Unrelated repository files remain outside
 the snapshot.
+
+Plugin snapshots verify inventoried bytes with SHA-256. Native companion captures
+may add or remove hard links while the old Gateway serves; link-only metadata
+changes do not invalidate unchanged files on Windows or POSIX. Content, file
+identity, type, permissions, ownership, size, and modification-time changes still
+refuse the snapshot.
+
+This check belongs to the installed updater. An older updater that reports
+`Plugin entry changed after snapshot inventory` during native capture cannot
+obtain this repair from the candidate it is already validating. Use the
+installation's [manual update method](/install/updating/update-methods), with a
+verified backup and the managed Gateway stopped during package replacement.
 
 Before each candidate check starts, the updater names the check and command.
 These progress messages go to stderr with `--json`, leaving stdout for the JSON

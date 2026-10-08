@@ -53,6 +53,7 @@ import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths
 import { resolveIdentityPathViaExistingAncestorSync } from "./boundary-path.js";
 import { listLegacyPairingStoreFiles } from "./pairing-files.js";
 import { isPathInside } from "./path-guards.js";
+import { resolveSqliteInspectionSignal } from "./sqlite-readonly-worker.js";
 import {
   legacyAgentQuarantineNotices,
   resolveLegacyStandaloneAgentDir,
@@ -114,7 +115,6 @@ import {
   migrateLegacyMeetingTranscripts,
 } from "./state-migrations.meeting-transcripts.js";
 import {
-  createLegacyStateMigrationStepReceipt,
   formatStartupMigrationFailure,
   logStateMigrationResult,
   mergeNotices,
@@ -183,6 +183,7 @@ import {
   createStateSchemaMigrationStep,
   describeStateSchemaMigration,
 } from "./state-migrations.state-schema.js";
+import { runLegacyStateMigrationSteps } from "./state-migrations.steps.js";
 import {
   detectLegacyTuiLastSessions,
   inspectLegacyTuiLastSessionRefusal,
@@ -1368,7 +1369,6 @@ function buildLegacyStateMigrationSteps(params: LegacyStateMigrationExecutionPla
         message: "Channel pairing account discovery is deferred to plugin validation.",
       }
     : undefined;
-  let unavailableWorkshopWorkspaces: ReadonlyMap<string, string> | undefined;
   const finalSteps: LegacyStateMigrationStep[] = [
     {
       ...ownerStep("workspace-state", detected.workspace, async (options) => {
@@ -1377,9 +1377,7 @@ function buildLegacyStateMigrationSteps(params: LegacyStateMigrationExecutionPla
         if (isDoctor) {
           await params.beforeWorkspaceStateMigration?.(params.sessionConfig ?? params.config);
         }
-        const result = await migrateLegacyWorkspaceState(options);
-        unavailableWorkshopWorkspaces = result.unavailableWorkshopWorkspaces;
-        return result;
+        return await migrateLegacyWorkspaceState(options);
       }),
       runWithoutFileDetection: isDoctor && params.beforeWorkspaceStateMigration !== undefined,
     },
@@ -1387,14 +1385,12 @@ function buildLegacyStateMigrationSteps(params: LegacyStateMigrationExecutionPla
     ...(isDoctor
       ? [
           {
-            // Workspace attestations must settle before Workshop relocation can retire them.
             ...finalStep("skill-workshop", async () => {
-              const { migrateLegacySkillWorkshopProposals } =
-                await import("../commands/doctor-skill-workshop-sqlite.js");
-              return migrateLegacySkillWorkshopProposals({
+              const { retireSkillWorkshopProposals } =
+                await import("../commands/doctor-skill-workshop-retire-proposals.js");
+              return retireSkillWorkshopProposals({
                 config: params.sessionConfig ?? params.config,
                 env: { ...env, OPENCLAW_STATE_DIR: stateDir },
-                unavailableWorkspaceDirs: unavailableWorkshopWorkspaces,
               });
             }),
             runWithoutFileDetection: true,
@@ -1873,11 +1869,11 @@ export async function planLegacyStateMigrationsReadOnly(params: {
   });
   for (const step of remainingMainSteps) {
     if (step.id === "skill-workshop") {
-      // Recorded legacy targets can name workspaces outside copied state.
+      // Draft exports target agent directories that can lie outside copied state.
       // Keep the owner visible without inspecting or granting those paths.
       step.refusal = {
         code: "skill-workshop-planning-deferred",
-        message: "Skill Workshop relocation requires separately bound workspace and skill targets.",
+        message: "Skill Workshop proposal export requires separately bound agent directories.",
       };
     }
   }
@@ -2062,147 +2058,6 @@ export async function planLegacyStateMigrationsReadOnly(params: {
   return plan;
 }
 
-async function runLegacyStateMigrationSteps(
-  steps: readonly LegacyStateMigrationStep[],
-  onStepReceipt?: (receipt: LegacyStateMigrationStepReceipt) => void,
-  shouldRun?: (step: LegacyStateMigrationStep) => boolean,
-  options?: {
-    onUnexpectedFailure?: (error: unknown) => void;
-    refusedAgentDatabasePaths?: Set<string>;
-  },
-): Promise<{
-  sources: MigrationMessages[];
-  sharedSources: MigrationMessages[];
-  finalSources: MigrationMessages[];
-  sharedNoticeSources: MigrationMessages[];
-  finalNoticeSources: MigrationMessages[];
-  entries: Array<{ id: string; result: MigrationMessages }>;
-  receipts: LegacyStateMigrationStepReceipt[];
-  deferredSteps: LegacyStateMigrationStep[];
-  haltedBy: LegacyStateMigrationStepReceipt | undefined;
-}> {
-  const sources: MigrationMessages[] = [];
-  const sharedSources: MigrationMessages[] = [];
-  const finalSources: MigrationMessages[] = [];
-  const sharedNoticeSources: MigrationMessages[] = [];
-  const finalNoticeSources: MigrationMessages[] = [];
-  const entries: Array<{ id: string; result: MigrationMessages }> = [];
-  const receipts: LegacyStateMigrationStepReceipt[] = [];
-  const deferredSteps: LegacyStateMigrationStep[] = [];
-  let haltedBy: LegacyStateMigrationStepReceipt | undefined;
-
-  // Keep writers serial. Scoped ownership refusals leave independent owners available.
-  for (const [index, step] of steps.entries()) {
-    const refusedDependencies = [...(options?.refusedAgentDatabasePaths ?? [])].filter(
-      (databasePath) =>
-        // Post-session plugins depend on canonical session repair, including its database owners.
-        step.deferredExecution?.kind === "post-session-plugin" ||
-        (step.reversibility !== "not-applicable" &&
-          [...step.source, ...step.target].some(
-            (endpoint) =>
-              endpoint.kind !== "owner" &&
-              (path.resolve(endpoint.path) === databasePath ||
-                (endpoint.kind === "path" && isPathInside(endpoint.path, databasePath))),
-          )),
-    );
-    if (refusedDependencies.length > 0) {
-      const message = `Migration step "${step.id}" was not run because it requires refused agent database(s): ${refusedDependencies.join(", ")}.`;
-      const result = { changes: [], warnings: [message] };
-      const receipt: LegacyStateMigrationStepReceipt = {
-        ...migrationStepPlan(step),
-        outcome: "refused",
-        ...result,
-        refusal: { code: "blocked-by-agent-database-refusal", message },
-        refusedAgentDatabasePaths: refusedDependencies,
-      };
-      entries.push({ id: step.id, result });
-      receipts.push(receipt);
-      onStepReceipt?.(receipt);
-      sources.push(result);
-      (step.phase === "shared" ? sharedSources : finalSources).push(result);
-      continue;
-    }
-    if (step.deferredExecution) {
-      // This phase depends on later canonical session repair. Keep its authority open
-      // until that writer runs; an earlier refusal still closes it through the tail path.
-      deferredSteps.push(step);
-      continue;
-    }
-    if (shouldRun && !shouldRun(step) && step.requiredness === "not-required") {
-      const receipt: LegacyStateMigrationStepReceipt = {
-        ...migrationStepPlan(step),
-        outcome: "skipped",
-        changes: [],
-        warnings: [],
-      };
-      receipts.push(receipt);
-      onStepReceipt?.(receipt);
-      continue;
-    }
-    let result: MigrationMessages;
-    let receipt: LegacyStateMigrationStepReceipt | undefined;
-    let unexpectedFailure: { error: unknown } | undefined;
-    try {
-      result = await step.run();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      result = { changes: [], warnings: [message] };
-      receipt = {
-        ...migrationStepPlan(step),
-        outcome: "refused",
-        ...result,
-        refusal: { code: "step-threw", message },
-      };
-      unexpectedFailure = { error };
-    }
-    receipt ??= createLegacyStateMigrationStepReceipt(migrationStepPlan(step), result);
-    entries.push({ id: step.id, result });
-    receipts.push(receipt);
-    onStepReceipt?.(receipt);
-    if (unexpectedFailure) {
-      options?.onUnexpectedFailure?.(unexpectedFailure.error);
-    }
-    sources.push(result);
-    (step.phase === "shared" ? sharedSources : finalSources).push(result);
-    if (!unexpectedFailure && step.collectNotices) {
-      (step.phase === "shared" ? sharedNoticeSources : finalNoticeSources).push(result);
-    }
-    if (receipt.outcome === "refused") {
-      if (
-        step.id === "media-persistence" &&
-        result.refusedAgentDatabasePaths?.length &&
-        options?.refusedAgentDatabasePaths
-      ) {
-        for (const databasePath of result.refusedAgentDatabasePaths) {
-          options.refusedAgentDatabasePaths.add(path.resolve(databasePath));
-        }
-        continue;
-      }
-      haltedBy = receipt;
-      receipts.push(
-        ...createBlockedLegacyStateMigrationStepReceipts({
-          steps: steps.slice(index + 1),
-          blocker: receipt,
-          onStepReceipt,
-        }),
-      );
-      break;
-    }
-  }
-
-  return {
-    sources,
-    sharedSources,
-    finalSources,
-    sharedNoticeSources,
-    finalNoticeSources,
-    entries,
-    receipts,
-    deferredSteps,
-    haltedBy,
-  };
-}
-
 function completedPluginMigrationFields(
   sources: readonly MigrationMessages[],
 ): Pick<MigrationMessages, "completedPluginIds" | "requiredPluginIds" | "statelessPluginIds"> {
@@ -2251,6 +2106,13 @@ export async function runLegacyStateMigrations(params: {
     stepReceipts: LegacyStateMigrationStepReceipt[];
   }
 > {
+  const signal = resolveSqliteInspectionSignal();
+  let failure: { error: unknown } | undefined;
+  const executionOptions = {
+    onUnexpectedFailure: (error: unknown) => {
+      failure ??= { error };
+    },
+  };
   const detected = params.detected;
   assertNoRetiredRuntimeStateFiles(detected.stateDir, params.env);
   assertNoRetiredStateFiles(
@@ -2282,22 +2144,31 @@ export async function runLegacyStateMigrations(params: {
       legacySessionSurfaces,
     });
   const { preparation: preparationSteps, remaining: remainingSteps } = buildSteps();
-  const preparation = await runLegacyStateMigrationSteps(preparationSteps, params.onStepReceipt);
+  const preparation = await runLegacyStateMigrationSteps(
+    preparationSteps,
+    params.onStepReceipt,
+    undefined,
+    executionOptions,
+  );
   if (preparation.haltedBy) {
     const notices = mergeNotices(preparation.sources);
+    const stepReceipts = [
+      ...preparation.receipts,
+      ...createBlockedLegacyStateMigrationStepReceipts({
+        steps: remainingSteps,
+        blocker: preparation.haltedBy,
+        onStepReceipt: params.onStepReceipt,
+      }),
+    ];
+    if (failure && signal?.aborted && failure.error === signal.reason) {
+      throw failure.error;
+    }
     return {
       changes: preparation.sources.flatMap((source) => source.changes),
       warnings: preparation.sources.flatMap((source) => source.warnings),
       ...(notices.length > 0 ? { notices } : {}),
       mode: "doctor",
-      stepReceipts: [
-        ...preparation.receipts,
-        ...createBlockedLegacyStateMigrationStepReceipts({
-          steps: remainingSteps,
-          blocker: preparation.haltedBy,
-          onStepReceipt: params.onStepReceipt,
-        }),
-      ],
+      stepReceipts,
     };
   }
 
@@ -2307,12 +2178,17 @@ export async function runLegacyStateMigrations(params: {
   const migrations = await runLegacyStateMigrationSteps(
     buildSteps(inventory).remaining,
     params.onStepReceipt,
+    undefined,
+    executionOptions,
   );
   const notices = mergeNotices([
     ...preparation.sources,
     ...migrations.sharedNoticeSources,
     ...migrations.finalNoticeSources,
   ]);
+  if (failure && signal?.aborted && failure.error === signal.reason) {
+    throw failure.error;
+  }
   return {
     mode: "doctor",
     ...completedPluginMigrationFields(migrations.sources),
@@ -2359,13 +2235,17 @@ export async function autoMigrateLegacyState(params: {
   stepReceipts: LegacyStateMigrationStepReceipt[];
   postSessionPluginMigration?: PreparedPostSessionPluginMigration;
 }> {
+  const signal = resolveSqliteInspectionSignal();
   let failure: { error: unknown } | undefined;
   const result = await executeLegacyStateMigrations(params, (error) => {
     failure ??= { error };
   });
-  // Automatic callers still receive the original failure, but only after the execution
-  // owner has closed every remaining receipt without running later migrations.
-  if (params.doctorOnlyStateMigrations !== true && failure) {
+  // Settle all receipts before forwarding cancellation to Doctor's service restoration.
+  if (
+    failure &&
+    (params.doctorOnlyStateMigrations !== true ||
+      (signal?.aborted && failure.error === signal.reason))
+  ) {
     throw failure.error;
   }
   return result;

@@ -39,7 +39,7 @@ import {
 import { getAbortMemory, isAbortRequestText } from "./abort-primitives.js";
 import { takeCommandSessionMetadataChangesFromTargets } from "./command-session-metadata.js";
 import type { CommandDispatchParams } from "./commands-types.js";
-import type { buildStatusReply } from "./commands.runtime.js";
+import type { buildStatusReply } from "./commands.js";
 import { isDirectiveOnly } from "./directive-handling.directive-only.js";
 import type { InlineDirectives } from "./directive-handling.parse.js";
 import { extractExplicitGroupId } from "./group-id.js";
@@ -56,14 +56,11 @@ const skillToolDispatchRuntimeLoader = createLazyImportLoader(
   () => import("../../skills/runtime/tool-dispatch.js"),
 );
 const abortCutoffRuntimeLoader = createLazyImportLoader(() => import("./abort-cutoff.runtime.js"));
-const commandsRuntimeLoader = createLazyImportLoader(() => import("./commands.runtime.js"));
+const commandsRuntimeLoader = createLazyImportLoader(() => import("./commands.js"));
 let builtinSlashCommands: Set<string> | null = null;
 
 function getBuiltinSlashCommands(): Set<string> {
-  if (builtinSlashCommands) {
-    return builtinSlashCommands;
-  }
-  builtinSlashCommands = listReservedChatSlashCommandNames([
+  return (builtinSlashCommands ??= listReservedChatSlashCommandNames([
     "btw",
     "think",
     "verbose",
@@ -73,8 +70,7 @@ function getBuiltinSlashCommands(): Set<string> {
     "model",
     "status",
     "queue",
-  ]);
-  return builtinSlashCommands;
+  ]));
 }
 
 function resolveSlashCommandName(commandBodyNormalized: string): string | null {
@@ -104,19 +100,6 @@ type InlineActionResult =
       explicitSkillSelections?: ExplicitSkillSelection[];
     };
 
-function extractTextFromToolResult(result: unknown): string | null {
-  const content = asOptionalObjectRecord(result)?.content;
-  return normalizeNullableString(
-    typeof content === "string" ? content : collectTextContentBlocks(content).join(""),
-  );
-}
-
-function extractBlockedToolReason(result: unknown): string | null {
-  const details = asOptionalObjectRecord(asOptionalObjectRecord(result)?.details);
-  return details?.status === "blocked" ? normalizeNullableString(details.reason) : null;
-}
-
-/** Handles inline actions or returns continue when the message should become a model turn. */
 export async function handleInlineActions(
   params: Omit<
     CommandDispatchParams,
@@ -153,6 +136,34 @@ export async function handleInlineActions(
     skillFilter?: string[];
   },
 ): Promise<InlineActionResult> {
+  const commandParams = {
+    cfg: params.cfg,
+    agentId: params.agentId,
+    agentDir: params.agentDir,
+    command: params.command,
+    initialSessionEntry: params.initialSessionEntry,
+    allowCreateSessionEntry: params.allowCreateSessionEntry,
+    previousSessionEntry: params.previousSessionEntry,
+    previousSessionMemory: params.previousSessionMemory,
+    previousSessionResetMessages: params.previousSessionResetMessages,
+    sessionStore: params.sessionStore,
+    sessionKey: params.sessionKey,
+    storePath: params.storePath,
+    sessionScope: params.sessionScope,
+    workspaceDir: params.workspaceDir,
+    opts: params.opts,
+    thinkingCatalog: params.thinkingCatalog,
+    resolveModelLevels: params.resolveModelLevels,
+    resolvedElevatedLevel: params.resolvedElevatedLevel,
+    blockReplyChunking: params.blockReplyChunking,
+    resolvedBlockStreamingBreak: params.resolvedBlockStreamingBreak,
+    resolveDefaultThinkingLevel: params.resolveDefaultThinkingLevel,
+    provider: params.provider,
+    model: params.model,
+    contextTokens: params.contextTokens,
+    isGroup: params.isGroup,
+    typing: params.typing,
+  };
   const {
     ctx,
     sessionCtx,
@@ -160,15 +171,9 @@ export async function handleInlineActions(
     agentId,
     agentDir,
     sessionEntry,
-    initialSessionEntry,
-    allowCreateSessionEntry,
-    previousSessionEntry,
-    previousSessionMemory,
-    previousSessionResetMessages,
     sessionStore,
     sessionKey,
     storePath,
-    sessionScope,
     workspaceDir,
     isGroup,
     opts,
@@ -182,17 +187,11 @@ export async function handleInlineActions(
     elevatedAllowed,
     elevatedFailures,
     defaultActivation,
-    thinkingCatalog,
     resolveModelLevels,
     resolvedVerboseLevel,
-    resolvedElevatedLevel,
-    execOverrides,
-    blockReplyChunking,
-    resolvedBlockStreamingBreak,
-    resolveDefaultThinkingLevel,
     provider,
     model,
-    contextTokens,
+    execOverrides,
     directiveAck,
     abortedLastRun: initialAbortedLastRun,
     skillFilter,
@@ -425,12 +424,20 @@ export async function handleInlineActions(
         }
         // The execution owner can observe revocation while arming cancellation.
         opts?.abortSignal?.throwIfAborted();
-        const result = await tool.execute(toolCallId, toolArgs, opts?.abortSignal);
-        const blockedReason = extractBlockedToolReason(result);
+        const result = asOptionalObjectRecord(
+          await tool.execute(toolCallId, toolArgs, opts?.abortSignal),
+        );
+        const details = asOptionalObjectRecord(result?.details);
+        const blockedReason =
+          details?.status === "blocked" ? normalizeNullableString(details.reason) : null;
         if (blockedReason) {
           return finishCommand({ text: `❌ Tool call blocked: ${blockedReason}` });
         }
-        const text = extractTextFromToolResult(result) ?? "✅ Done.";
+        const content = result?.content;
+        const text =
+          normalizeNullableString(
+            typeof content === "string" ? content : collectTextContentBlocks(content).join(""),
+          ) ?? "✅ Done.";
         return finishCommand({ text });
       } catch (err) {
         const message = formatErrorMessage(err);
@@ -510,24 +517,11 @@ export async function handleInlineActions(
   if (handleInlineStatus) {
     const { buildStatusReply } = await commandsRuntimeLoader.load();
     const inlineStatusReply = await buildStatusReply({
-      cfg,
-      agentId,
-      command,
+      ...commandParams,
       sessionEntry: targetSessionEntry,
-      sessionKey,
       parentSessionKey: targetSessionEntry?.parentSessionKey ?? ctx.ParentSessionKey,
-      sessionScope,
-      storePath,
-      provider,
-      model,
-      contextTokens,
-      workspaceDir,
-      thinkingCatalog,
       ...(await resolveModelLevels()),
       resolvedVerboseLevel: resolvedVerboseLevel ?? "off",
-      resolvedElevatedLevel,
-      resolveDefaultThinkingLevel,
-      isGroup,
       defaultGroupActivation: defaultActivation,
       mediaDecisions: ctx.MediaUnderstandingDecisions,
     });
@@ -539,14 +533,11 @@ export async function handleInlineActions(
   const runCommands = async (commandInput: typeof command) => {
     const { handleCommands } = await commandsRuntimeLoader.load();
     return handleCommands({
-      // Pass sessionCtx so command handlers can mutate stripped body for same-turn continuation.
+      ...commandParams,
+      // Command handlers mutate the continuation context and retain the dispatch context.
       ctx: sessionCtx,
-      // Keep original finalized context in sync when command handlers need outer-dispatch side effects.
       rootCtx: ctx,
-      cfg,
       command: commandInput,
-      agentId,
-      agentDir,
       directives,
       elevated: {
         enabled: elevatedEnabled,
@@ -554,35 +545,13 @@ export async function handleInlineActions(
         failures: elevatedFailures,
       },
       sessionEntry: targetSessionEntry,
-      initialSessionEntry,
-      allowCreateSessionEntry,
-      previousSessionEntry,
-      previousSessionMemory,
-      previousSessionResetMessages,
-      sessionStore,
-      sessionKey,
-      storePath,
-      sessionScope,
-      workspaceDir,
-      opts,
       defaultGroupActivation: defaultActivation,
-      thinkingCatalog,
-      resolveModelLevels,
       resolvedVerboseLevel: resolvedVerboseLevel ?? "off",
-      resolvedElevatedLevel,
-      blockReplyChunking,
-      resolvedBlockStreamingBreak,
-      resolveDefaultThinkingLevel,
-      provider,
-      model,
-      contextTokens,
-      isGroup,
       skillCommands,
       ...createSkillCommandLoaders(skillCommandsRuntimeLoader.load, {
         ...skillCommandContext,
         skillFilter,
       }),
-      typing,
     });
   };
 
