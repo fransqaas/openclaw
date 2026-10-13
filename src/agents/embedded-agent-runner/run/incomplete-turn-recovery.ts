@@ -117,6 +117,7 @@ function isToolErrorConsumedByModel(attempt: IncompleteTurnAttempt): boolean {
   }
   const snapshot = attempt.messagesSnapshot ?? [];
   const failedResultIndex = snapshot.findLastIndex((message) => {
+    // SAFETY: SettledToolResult only declares optional unknown fields, each checked below.
     const { toolName, isError } = message as SettledToolResult;
     return message.role === "toolResult" && isError === true && toolName === failure.toolName;
   });
