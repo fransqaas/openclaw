@@ -106,12 +106,34 @@ export function shouldRetrySilentErrorAssistantTurn(params: {
   return hasOnlyAssistantReasoningContent(assistant);
 }
 
+/**
+ * Transcript proof that the retained failure is already answered: its error
+ * result is persisted and a later assistant message followed it.
+ */
+function isToolErrorConsumedByModel(attempt: IncompleteTurnAttempt): boolean {
+  const failure = attempt.lastToolError;
+  if (!failure) {
+    return true;
+  }
+  const snapshot = attempt.messagesSnapshot ?? [];
+  const failedResultIndex = snapshot.findLastIndex((message) => {
+    const { toolName, isError } = message as SettledToolResult;
+    return message.role === "toolResult" && isError === true && toolName === failure.toolName;
+  });
+  return (
+    failedResultIndex >= 0 &&
+    snapshot.slice(failedResultIndex + 1).some((message) => message.role === "assistant")
+  );
+}
+
 function shouldSkipNonVisibleTurnRetry(params: {
   aborted: boolean;
   timedOut: boolean;
   attempt: IncompleteTurnAttempt;
   /** Silent classification can tolerate completed effects, never unfinished work or replay. */
   tolerateSideEffects?: boolean;
+  /** A call that never ran may follow a tool failure the model already answered. */
+  tolerateConsumedToolError?: boolean;
 }): boolean {
   return Boolean(
     params.aborted ||
@@ -120,7 +142,8 @@ function shouldSkipNonVisibleTurnRetry(params: {
     params.attempt.clientToolCalls ||
     params.attempt.yieldDetected ||
     params.attempt.didSendDeterministicApprovalPrompt ||
-    params.attempt.lastToolError ||
+    (params.attempt.lastToolError &&
+      !(params.tolerateConsumedToolError && isToolErrorConsumedByModel(params.attempt))) ||
     hasAcceptedSessionSpawn(params.attempt.acceptedSessionSpawns) ||
     params.attempt.itemLifecycle.activeCount > 0 ||
     params.attempt.itemLifecycle.completedCount < params.attempt.itemLifecycle.startedCount ||
@@ -386,9 +409,16 @@ export function resolveEmptyResponseRetryInstruction(
     (assistant.errorCode === MALFORMED_TOOL_CALL_ARGUMENTS_ERROR_CODE ||
       isPreDispatchToolCallRejectionMessage(assistant.errorMessage)) &&
     readSettledToolCalls(assistant).length === 0;
-  // Settled earlier effects are tolerated only for a call that never ran;
-  // unfinished, async or failed work still blocks the continuation.
-  if (shouldSkipNonVisibleTurnRetry({ ...params, tolerateSideEffects: rejectedBeforeDispatch })) {
+  // Settled earlier effects, and failures the model already answered, are
+  // tolerated only for a call that never ran; unfinished or async work still
+  // blocks the continuation.
+  if (
+    shouldSkipNonVisibleTurnRetry({
+      ...params,
+      tolerateSideEffects: rejectedBeforeDispatch,
+      tolerateConsumedToolError: rejectedBeforeDispatch,
+    })
+  ) {
     return null;
   }
 

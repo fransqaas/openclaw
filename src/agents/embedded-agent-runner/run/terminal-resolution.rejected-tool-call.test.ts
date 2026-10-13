@@ -104,6 +104,68 @@ describe("terminal resolution for a tool call rejected before dispatch", () => {
     ).resolves.toEqual({ action: "retry" });
   });
 
+  // The follow-up report: an exec call was refused by preflight, the model read
+  // that error and answered with another call whose JSON was malformed.
+  function rejectedCallAfterConsumedToolError(params: { modelSawFailure: boolean }) {
+    const rejected = buildEmbeddedRunnerAssistant({
+      api: "openai-completions",
+      provider: "meterkey",
+      model: "deepseek/deepseek-v4-flash",
+      stopReason: "error",
+      errorMessage: REJECTED_TOOL_CALL_MESSAGE,
+      content: [],
+    });
+    const refusedExec = {
+      role: "toolResult",
+      toolCallId: "call_exec",
+      toolName: "exec",
+      isError: true,
+      content: [{ type: "text", text: "exec preflight: complex interpreter invocation detected" }],
+    };
+    const execCall = buildEmbeddedRunnerAssistant({
+      stopReason: "toolUse",
+      content: [{ type: "toolCall", id: "call_exec", name: "exec", arguments: {} }],
+    });
+    const messagesSnapshot = [
+      { role: "user", content: "summarize the repo" },
+      execCall,
+      refusedExec,
+      ...(params.modelSawFailure ? [rejected] : []),
+    ] as unknown as Parameters<typeof makeEmbeddedRunnerAttempt>[0]["messagesSnapshot"];
+    return rejectedCallAfterSettledTool({
+      lastAssistant: rejected,
+      currentAttemptAssistant: rejected,
+      lastToolError: { toolName: "exec", error: "exec preflight refused" },
+      messagesSnapshot,
+    });
+  }
+
+  it("continues after an earlier tool failure the model already answered", async () => {
+    const activateInternalPrompt = vi.fn();
+    await expect(
+      resolveEmbeddedRunTerminal(
+        makeTerminalInput({
+          ...rejectedCallAfterConsumedToolError({ modelSawFailure: true }),
+          sessionPromptState: { activateInternalPrompt },
+        }),
+      ),
+    ).resolves.toEqual({ action: "retry" });
+    expect(activateInternalPrompt.mock.calls[0]?.[0]).toContain("rejected before it ran");
+  });
+
+  it("does not continue when no model response followed the tool failure", async () => {
+    const activateInternalPrompt = vi.fn();
+    const result = await resolveEmbeddedRunTerminal(
+      makeTerminalInput({
+        ...rejectedCallAfterConsumedToolError({ modelSawFailure: false }),
+        sessionPromptState: { activateInternalPrompt },
+      }),
+    );
+
+    expect(result.action).toBe("complete");
+    expect(activateInternalPrompt).not.toHaveBeenCalled();
+  });
+
   it("does not continue after an unrelated provider error", async () => {
     const overrides = {};
     const assistant = { errorMessage: "upstream connect error" };
