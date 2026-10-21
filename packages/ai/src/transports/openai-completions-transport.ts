@@ -7,6 +7,7 @@ import type {
   StreamFn,
 } from "@openclaw/llm-core";
 import OpenAI from "openai";
+import type { ChatCompletion, ChatCompletionChunk } from "openai/resources/chat/completions.js";
 import { getEnvApiKey } from "../env-api-keys.js";
 import { getAiTransportHost } from "../host.js";
 import {
@@ -14,6 +15,7 @@ import {
   reasoningTagTextPolicy,
   type OpenAICompletionsOptions,
 } from "../provider-options.js";
+import { resolveProviderContext } from "../provider-types.js";
 import { resolveCacheRetention } from "../providers/cache-retention.js";
 import { buildCopilotDynamicHeaders } from "../providers/github-copilot-headers.js";
 import { finalizeOpenAICompletionsToolCalls } from "../providers/openai-completions-tool-calls.js";
@@ -24,6 +26,7 @@ import {
   createFirstStreamEventAbortController,
   getFirstStreamEventTimeoutHandler,
   getFirstStreamEventTimeoutMs,
+  withFirstStreamEventTimeout,
 } from "../utils/stream-first-event-timeout.js";
 import { boundResponseBody } from "../utils/streaming-byte-guard.js";
 import { createAssistantOutput } from "./assistant-output.js";
@@ -35,9 +38,13 @@ import {
   resolveOpenAICompletionsCompat,
 } from "./openai-completions-compat.js";
 import { isAzureOpenAICompatibleHost } from "./openai-completions-host.js";
-import { buildOpenAICompletionsRequest } from "./openai-completions-params.js";
+import {
+  buildOpenAICompletionsRequest,
+  resolveCompletionsContextOutputBudget,
+} from "./openai-completions-params.js";
 import {
   processCompletionsStream,
+  observeOpenAICompletionsProgress,
   shouldEmitOpenAICompletionsReasoning,
 } from "./openai-completions-stream.js";
 import { createOpenAIResponsesTransportStreamFn } from "./openai-responses-client.js";
@@ -56,6 +63,7 @@ import {
   isOpenAICompletionsThinkingEnabled,
   resolveOpenAIClientBaseUrl,
   resolvePromptCacheKey,
+  withOpenAIErrorResponseHook,
   type MutableAssistantOutput,
 } from "./openai-transport-shared.js";
 import {
@@ -87,6 +95,12 @@ function assertOpenAICompletionsPayloadHasConversationTurn(
     `OpenAI-compatible chat payload for ${model.provider}/${model.id} contains no non-empty user or assistant messages after compaction and transport transforms; refusing to send a system/tool-only request. Start a new user turn or repair the compacted session history.`,
   );
 }
+
+// Bound provider chunks, not repeated cumulative assistant snapshots. A normal
+// multi-token reasoning response otherwise exhausts the event buffer quadratically.
+const MAX_CONTEXT_BUDGET_BUFFER_CHUNKS = 8_192;
+const MAX_CONTEXT_BUDGET_BUFFER_BYTES = 4 * 1_024 * 1_024;
+type Completion = ChatCompletionChunk | ChatCompletion;
 
 const SSE_DONE_LINE_RE = /^data:[ \t]*\[DONE\][ \t]*$/i;
 const SSE_DONE_MAX_LINE_CHARS = 1_024;
@@ -304,8 +318,10 @@ export function streamOpenAICompletionsRequest(
   const { eventStream, stream } = createWritableTransportEventStream();
   void (async () => {
     const output: MutableAssistantOutput = createAssistantOutput(model);
+    let discardCandidate = false;
     let firstEventAbort: ReturnType<typeof createFirstStreamEventAbortController> | undefined;
     try {
+      const requestContext = await resolveProviderContext(context, options);
       const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
       const directEmitReasoning = Boolean(
         mode === "direct" &&
@@ -325,14 +341,15 @@ export function streamOpenAICompletionsRequest(
                 model,
                 context,
                 apiKey,
-                resolveProviderSimpleCompletionHeaders(model, options),
+                options,
                 cacheRetention === "none" ? undefined : options?.sessionId,
                 policy.compat,
               ),
               sawStreamDONE: undefined,
             }
           : createManagedCompletionsClient(model, context, options, apiKey, cacheRetention);
-      let params = buildOpenAICompletionsRequest(model, context, options, policy);
+      const builtParams = buildOpenAICompletionsRequest(model, requestContext, options, policy);
+      let params = builtParams;
       const encodeBody = prepareModelRequestBody(options);
       const nextParams = await options?.onPayload?.(params, model);
       if (nextParams !== undefined) {
@@ -356,6 +373,7 @@ export function streamOpenAICompletionsRequest(
           assertOpenAICompletionsPayloadHasConversationTurn(params, model);
         }
       }
+      const contextOutputBudget = resolveCompletionsContextOutputBudget(builtParams, params);
       const emitReasoning =
         mode === "direct"
           ? directEmitReasoning
@@ -404,16 +422,115 @@ export function streamOpenAICompletionsRequest(
         signal: firstEventAbort.signal,
         abort: firstEventAbort.abort,
         hook: createOpenAIProviderAcceptanceHook(options, response, model),
-        onReady: () => stream.push({ type: "start", partial: output }),
+        onReady: () => {
+          if (contextOutputBudget === undefined) {
+            stream.push({ type: "start", partial: output });
+          }
+        },
       });
+      const providerStream = observeOpenAICompletionsProgress(
+        withFirstStreamEventTimeout(hookedResponseStream, {
+          provider: model.provider,
+          api: model.api,
+          model: model.id,
+          timeoutMs: getFirstStreamEventTimeoutMs(options) ?? 0,
+          stage: "completions",
+          abort: firstEventAbort.abort,
+          onTimeout: getFirstStreamEventTimeoutHandler(options),
+          hint: "The provider may be stalled while parsing the tool payload; retry with a smaller tool surface or enable OPENCLAW_DEBUG_MODEL_PAYLOAD=tools to inspect exposed tools.",
+        }),
+        options?.signal,
+      );
+      const buffered =
+        contextOutputBudget === undefined
+          ? undefined
+          : await (async () => {
+              const iterator = providerStream[Symbol.asyncIterator]();
+              const chunks: Completion[] = [];
+              let bufferedBytes = 0;
+              let overflow: IteratorYieldResult<Completion> | undefined;
+              let finished = false;
+              let failed = false;
+              let sourceError: unknown;
+              let finishReason: string | undefined;
+              try {
+                for (;;) {
+                  const next = await iterator.next();
+                  if (next.done) {
+                    finished = true;
+                    break;
+                  }
+                  const chunk = next.value;
+                  const chunkBytes = Buffer.byteLength(JSON.stringify(chunk) ?? "", "utf8");
+                  if (
+                    chunks.length >= MAX_CONTEXT_BUDGET_BUFFER_CHUNKS ||
+                    bufferedBytes + chunkBytes > MAX_CONTEXT_BUDGET_BUFFER_BYTES
+                  ) {
+                    overflow = next;
+                    break;
+                  }
+                  chunks.push(chunk);
+                  bufferedBytes += chunkBytes;
+                  const chunkFinishReason = chunk?.choices?.[0]?.finish_reason;
+                  if (chunkFinishReason) {
+                    finishReason = chunkFinishReason;
+                  }
+                  options?.signal?.throwIfAborted();
+                }
+              } catch (error) {
+                failed = true;
+                sourceError = error;
+                // Replay the received prefix into the reducer before surfacing this error,
+                // retaining real provider usage without publishing incomplete candidate tools.
+                void iterator.return?.(undefined).catch(() => undefined);
+              }
+              const bounded = overflow === undefined;
+              return {
+                bounded,
+                failed,
+                finishReason,
+                stream: {
+                  async *[Symbol.asyncIterator]() {
+                    try {
+                      yield* chunks;
+                      if (failed) {
+                        throw sourceError;
+                      }
+                      if (overflow !== undefined) {
+                        yield overflow.value;
+                        for (;;) {
+                          const next = await iterator.next();
+                          if (next.done) {
+                            finished = true;
+                            return;
+                          }
+                          yield next.value;
+                        }
+                      }
+                    } finally {
+                      chunks.length = 0;
+                      if (!finished && !failed) {
+                        void iterator.return?.(undefined).catch(() => undefined);
+                      }
+                    }
+                  },
+                },
+              };
+            })();
+      discardCandidate = Boolean(
+        buffered?.bounded && (buffered.failed || buffered.finishReason === "length"),
+      );
+      if (buffered && !discardCandidate) {
+        stream.push({ type: "start", partial: output });
+      }
       const directEvents =
         mode === "direct" ? createDirectCompletionsEventStream(output, stream) : undefined;
       try {
         await processCompletionsStream(
-          hookedResponseStream,
+          buffered?.stream ?? providerStream,
           output,
           model,
-          directEvents?.stream ?? stream,
+          discardCandidate ? { push() {} } : (directEvents?.stream ?? stream),
           {
             ...(directEvents
               ? {
@@ -421,15 +538,17 @@ export function streamOpenAICompletionsRequest(
                   beforeContentBlock: directEvents.beforeContentBlock,
                 }
               : { mode: "managed" as const }),
-            signal: options?.signal,
+            signal: discardCandidate ? undefined : options?.signal,
             emitReasoning,
             strictReasoningTags: reasoningTagTextPolicy.isStrict(options),
-            firstEventTimeoutMs: getFirstStreamEventTimeoutMs(options),
-            abortFirstEventStream: firstEventAbort.abort,
-            onFirstEventTimeout: getFirstStreamEventTimeoutHandler(options),
             sawStreamDONE,
           },
         );
+        if (discardCandidate) {
+          throw new Error(
+            `Context length exceeded: automatic output budget of ${contextOutputBudget} tokens exhausted before completion.`,
+          );
+        }
         if (directEvents) {
           if (options?.signal?.aborted) {
             throw transportAbortError(options.signal);
@@ -450,6 +569,9 @@ export function streamOpenAICompletionsRequest(
       directEvents?.finish(output.stopReason === "toolUse");
       finalizeTransportStream({ stream, output, signal: options?.signal });
     } catch (error) {
+      if (discardCandidate) {
+        output.content = [];
+      }
       failTransportStream({
         stream,
         output,
@@ -457,13 +579,6 @@ export function streamOpenAICompletionsRequest(
         error,
         cleanup: () => {
           finalizeOpenAICompletionsToolCalls(output, { allowSilentToolCallPromotion: false });
-          if (mode === "direct") {
-            for (const block of output.content) {
-              delete (block as { index?: number }).index;
-              delete (block as { partialJson?: string }).partialJson;
-              delete (block as { streamIndex?: number }).streamIndex;
-            }
-          }
         },
       });
     } finally {
@@ -477,7 +592,7 @@ function createDirectCompletionsClient(
   model: Model<"openai-completions">,
   context: Context,
   apiKey: string,
-  optionsHeaders: Record<string, string> | undefined,
+  options: OpenAICompletionsOptions | undefined,
   sessionId: string | undefined,
   compat: ReturnType<typeof resolveOpenAICompletionsCompat>,
 ) {
@@ -497,7 +612,13 @@ function createDirectCompletionsClient(
       headers["x-session-affinity"] = sessionId;
     }
   }
-  return createOpenAIProviderClient(model, apiKey, headers, optionsHeaders);
+  return createOpenAIProviderClient(
+    model,
+    apiKey,
+    headers,
+    resolveProviderSimpleCompletionHeaders(model, options),
+    options?.onResponse,
+  );
 }
 
 function createManagedCompletionsClient(
@@ -523,11 +644,15 @@ function createManagedCompletionsClient(
   const doneDetector = createSseDoneDetector();
   // The SDK replaces the fetch signal; keep liveness keyed to the exact
   // caller signal watched by the idle timer.
-  const baseFetch = buildGuardedModelFetch(model, undefined, {
-    onSseComment: () => notifyLlmRequestActivity(options?.signal, false),
-  });
+  const baseFetch = withOpenAIErrorResponseHook(
+    buildGuardedModelFetch(model, undefined, {
+      onSseComment: () => notifyLlmRequestActivity(options?.signal, false),
+    }),
+    options?.onResponse,
+    model,
+  );
   const doneDetectingFetch: typeof globalThis.fetch = async (url, init) => {
-    const response = await baseFetch(url as never, init);
+    const response = await baseFetch(url, init);
     if (!response.body || !response.ok) {
       return response;
     }

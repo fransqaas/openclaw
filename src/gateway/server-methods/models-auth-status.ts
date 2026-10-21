@@ -17,18 +17,20 @@ import {
   formatRemainingShort,
 } from "../../agents/auth-health.js";
 import {
-  ensureAuthProfileStoreWithoutExternalProfiles,
+  ensureAuthProfileStoreWithoutExternalProfilesAsync,
   externalCliDiscoveryForConfigStatus,
   listProfilesForProvider,
   resolveAuthProfileMetadata,
   resolveExplicitAuthOrderSelection,
 } from "../../agents/auth-profiles.js";
+import { refreshRuntimeAuthProfileStoreSources } from "../../agents/auth-profiles/runtime-snapshots.js";
 import type { RuntimeAuthProfileStore } from "../../agents/auth-profiles/types.js";
 import { resolveProviderIdForAuth } from "../../agents/provider-auth-aliases.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { providerUsageLabel, resolveUsageProviderId } from "../../infra/provider-usage.shared.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { refreshActiveProviderAuthRuntimeSnapshot } from "../../secrets/runtime.js";
+import { createChatAbortOps } from "../chat-abort-ops.js";
 import { abortChatRunsForProvider } from "../chat-abort.js";
 import { refreshModelAuthStateAfterMutation } from "../model-auth-refresh.js";
 import { hasGatewayAdminScope } from "../operator-scopes.js";
@@ -275,7 +277,7 @@ export const modelsAuthStatusHandlers: GatewayRequestHandlers = {
       }
       const { agentDir } = scope;
       const authProvider = resolveProviderIdForAuth(provider, { config: cfg });
-      const store = ensureAuthProfileStoreWithoutExternalProfiles(agentDir);
+      const store = await ensureAuthProfileStoreWithoutExternalProfilesAsync(agentDir);
       const availableProfiles = listProfilesForProvider(store, provider);
       const removedProfiles =
         selection.profileIds ??
@@ -310,22 +312,12 @@ export const modelsAuthStatusHandlers: GatewayRequestHandlers = {
       const { runIds: abortedRunIds } =
         selection.profileIds || apiKeyOnly
           ? { runIds: [] as string[] }
-          : abortChatRunsForProvider(
-              {
-                chatAbortControllers: context.chatAbortControllers,
-                chatRunState: context.chatRunState,
-                removeChatRun: context.removeChatRun,
-                agentRunSeq: context.agentRunSeq,
-                broadcast: context.broadcast,
-                nodeSendToSession: context.nodeSendToSession,
-              },
-              {
-                cfg,
-                providerId: authProvider,
-                agentId: scope.agentId,
-                stopReason: "auth-revoked",
-              },
-            );
+          : abortChatRunsForProvider(createChatAbortOps(context), {
+              cfg,
+              providerId: authProvider,
+              agentId: scope.agentId,
+              stopReason: "auth-revoked",
+            });
       const refreshWarning = await refreshAfterCredentialMutation(context, scope.agentId);
       const warning = [configWarning, refreshWarning].filter(Boolean).join(" ");
       const result: ModelAuthLogoutResult = {
@@ -357,6 +349,7 @@ export const modelsAuthStatusHandlers: GatewayRequestHandlers = {
       }
       if (refreshRequested) {
         // Refresh into the transient prepared owner; mutations alone clear warmed auth state.
+        await refreshRuntimeAuthProfileStoreSources();
         await refreshActiveProviderAuthRuntimeSnapshot();
         cfg = context.getRuntimeConfig();
         scope = resolveScope(cfg);
@@ -398,14 +391,13 @@ export const modelsAuthStatusHandlers: GatewayRequestHandlers = {
         authHealth,
         usageProviderIds,
         externalProfileIds,
-        externalCliProfileIds,
         logoutProfileIds,
         configBoundProfileIds,
         configBoundAuthProviders,
         providerCapabilities,
       } = readModelAuthStatusFacts(preparedSnapshot, refreshRequested, now);
 
-      const providerUsageRuntime = getProviderUsageRuntimeSnapshot({
+      const providerUsageRuntime = await getProviderUsageRuntimeSnapshot({
         config: cfg,
         agentId,
         agentDir,
@@ -451,27 +443,11 @@ export const modelsAuthStatusHandlers: GatewayRequestHandlers = {
           credentialType: usageProfile?.type,
         });
         const usage = usageKey ? usageByProvider.get(usageKey) : undefined;
-        const rawRollup = aggregateRefreshableAuthStatus(
+        const rollup = aggregateRefreshableAuthStatus(
           prov,
           Date.now(),
           expectsOAuth.has(prov.provider),
         );
-        const effectiveProfiles = prov.effectiveProfiles ?? prov.profiles;
-        const refreshableProfiles = effectiveProfiles.filter(
-          (profile) => profile.type === "oauth" || profile.type === "token",
-        );
-        // External CLI access tokens rotate without operator action. Keep their raw
-        // profile expiry diagnostic, but do not turn it into a provider login warning.
-        const externalCliOwnsOAuthRefresh =
-          refreshableProfiles.length > 0 &&
-          refreshableProfiles.every(
-            (profile) => profile.type === "oauth" && externalCliProfileIds.has(profile.profileId),
-          );
-        const rollup: ModelAuthStatusRollup =
-          externalCliOwnsOAuthRefresh &&
-          (rawRollup.status === "expired" || rawRollup.status === "expiring")
-            ? { status: "ok" }
-            : rawRollup;
         const apiKey = apiKeys.get(normalizeProviderId(prov.provider));
         const hasRefreshableProfile = prov.profiles.some(
           (profile) => profile.type === "oauth" || profile.type === "token",
@@ -505,9 +481,6 @@ export const modelsAuthStatusHandlers: GatewayRequestHandlers = {
                 prof.expiresAt,
               ),
             };
-            if (externalCliProfileIds.has(prof.profileId)) {
-              profile.externallyManaged = true;
-            }
             if (includeProfileIdentity && metadata.displayName) {
               profile.displayName = metadata.displayName;
             }

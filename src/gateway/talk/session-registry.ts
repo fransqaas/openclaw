@@ -1,3 +1,4 @@
+import { throwSettledAggregate } from "../../infra/error-graph-internal.js";
 import { formatErrorMessage as formatError } from "../../infra/errors.js";
 import { resolveGlobalMap } from "../../shared/global-singleton.js";
 import {
@@ -36,7 +37,6 @@ const unifiedTalkSessions = resolveGlobalMap<string, UnifiedTalkSessionRecord>(
 );
 type TalkConnectionCleanup = {
   run: () => void | Promise<void>;
-  nextRun?: () => void | Promise<void>;
   pending?: Promise<void>;
   failed: boolean;
 };
@@ -46,21 +46,7 @@ const talkConnectionCleanups = resolveGlobalMap<
   Map<TalkConnectionCleanupKind, TalkConnectionCleanup>
 >(
   Symbol.for("openclaw.talkConnectionCleanups"),
-  async (connections) => {
-    const results = await Promise.allSettled(
-      [...connections].flatMap(([connId, cleanups]) =>
-        [...cleanups].map(async ([kind, cleanup]) => {
-          await runTalkConnectionCleanup(connId, kind, cleanup);
-        }),
-      ),
-    );
-    const failures = results.flatMap((result) =>
-      result.status === "rejected" ? [result.reason] : [],
-    );
-    if (failures.length > 0) {
-      throw new AggregateError(failures, "Talk provider cleanup did not complete");
-    }
-  },
+  (connections) => closeTalkConnections(connections.keys()),
   "close-and-restart",
 );
 
@@ -80,11 +66,6 @@ function runTalkConnectionCleanup(
     cleanup.failed = false;
     const cleanups = talkConnectionCleanups.get(connId);
     if (cleanups?.get(kind) === cleanup) {
-      if (cleanup.nextRun) {
-        cleanup.run = cleanup.nextRun;
-        cleanup.nextRun = undefined;
-        return runTalkConnectionCleanup(connId, kind, cleanup);
-      }
       cleanups.delete(kind);
       if (cleanups.size === 0 && talkConnectionCleanups.get(connId) === cleanups) {
         talkConnectionCleanups.delete(connId);
@@ -119,10 +100,9 @@ export function registerTalkConnectionCleanup(
     talkConnectionCleanups.get(connId) ??
     new Map<TalkConnectionCleanupKind, TalkConnectionCleanup>();
   const previous = cleanups.get(kind);
-  // Each kind scans its live sessions; retain a failed original before the latest replacement.
-  if (previous?.pending || previous?.failed) {
-    previous.nextRun = cleanup;
-  } else {
+  // Each kind scans all its live sessions. A replacement callback adds no work
+  // while that same kind is draining or awaiting retry.
+  if (!previous?.pending && !previous?.failed) {
     cleanups.set(kind, { run: cleanup, failed: false });
   }
   talkConnectionCleanups.set(connId, cleanups);
@@ -212,12 +192,7 @@ async function closeTalkConnections(connIds: Iterable<string>): Promise<void> {
     }
   }
   const results = await Promise.allSettled(pending);
-  const failures = results.flatMap((result) =>
-    result.status === "rejected" ? [result.reason] : [],
-  );
-  if (failures.length > 0) {
-    throw new AggregateError(failures, "Talk provider cleanup did not complete");
-  }
+  throwSettledAggregate(results, "Talk provider cleanup did not complete");
 }
 
 export function rememberUnifiedTalkSession(
@@ -228,7 +203,7 @@ export function rememberUnifiedTalkSession(
 }
 
 export function getUnifiedTalkSession(sessionId: string): UnifiedTalkSessionRecord {
-  const session = unifiedTalkSessions.get(sessionId);
+  const session = unifiedTalkSessions.get(sessionId.trim());
   if (!session) {
     throw new Error("Unknown Talk session");
   }
@@ -237,7 +212,8 @@ export function getUnifiedTalkSession(sessionId: string): UnifiedTalkSessionReco
 
 /** Retains the realtime relay's admitted target without reinterpreting current defaults. */
 export function resolveUnifiedTalkSessionTarget(sessionId: string, connId: string | undefined) {
-  const session = unifiedTalkSessions.get(sessionId);
+  const id = sessionId.trim();
+  const session = unifiedTalkSessions.get(id);
   if (session?.kind !== "realtime-relay") {
     return undefined;
   }
@@ -246,14 +222,14 @@ export function resolveUnifiedTalkSessionTarget(sessionId: string, connId: strin
   return {
     target,
     isCurrent: () =>
-      unifiedTalkSessions.get(sessionId) === session &&
+      unifiedTalkSessions.get(id) === session &&
       session.connId === connId &&
       session.sessionTarget === target,
   };
 }
 
 export function forgetUnifiedTalkSession(sessionId: string): void {
-  unifiedTalkSessions.delete(sessionId);
+  unifiedTalkSessions.delete(sessionId.trim());
 }
 
 export function requireUnifiedTalkSessionConn(

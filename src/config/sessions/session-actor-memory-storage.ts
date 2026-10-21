@@ -1,8 +1,23 @@
+import { isDeepStrictEqual } from "node:util";
+import { BoardValidationError } from "../../boards/board-layout.js";
 import { parseAgentSessionKey, toAgentStoreSessionKey } from "../../routing/session-key.js";
-import { isIncognitoSessionKey } from "../../shared/incognito-session-key.js";
 import { SessionGoalOperationError } from "./goals-operations.types.js";
-import type { SessionActorTarget } from "./session-actor-contract.js";
+import type {
+  SessionActor,
+  SessionActorLifetime,
+  SessionActorTarget,
+  SessionActorStorage,
+} from "./session-actor-contract.js";
 import type { SessionActorExecutorGuards } from "./session-actor-executor.js";
+import {
+  cloneSessionActorMemoryConversations,
+  type SessionActorMemoryConversationOwner,
+} from "./session-actor-memory-conversation-contract.js";
+import {
+  selectSessionActorMemoryConversations,
+  syncSessionActorMemoryConversations,
+} from "./session-actor-memory-conversation.js";
+import { publishSessionActorMemoryChanges } from "./session-actor-memory-publication.js";
 import { validateSessionActorMemorySources } from "./session-actor-memory-sources.js";
 import {
   advanceSessionActorMemoryState,
@@ -17,7 +32,6 @@ import {
   readSessionActorMemoryStorage,
 } from "./session-actor-memory-storage-dispatch.js";
 import type {
-  SessionActorStorage,
   SessionActorStorageAuthority,
   SessionActorStorageChange,
   SessionActorStorageCommand,
@@ -26,9 +40,38 @@ import type {
   SessionActorStorageReads,
   SessionActorStorageWrites,
 } from "./session-actor-storage-contract.js";
+import {
+  SqliteTranscriptMutationConflictError,
+  SqliteSessionMutationConflictError,
+  SessionEntryLifecycleUpsertConflictError,
+} from "./session-mutation-conflict-error.js";
+import { SessionPendingInputCustodyError } from "./session-pending-input-custody-error.js";
+import {
+  SessionTranscriptWriterClaimReboundError,
+  parseTranscriptAppendRefusal,
+} from "./session-transcript-writer-claim-error.js";
 
 function errorFacts(error: unknown) {
-  if (error instanceof SessionGoalOperationError) {
+  if (error instanceof SqliteTranscriptMutationConflictError) {
+    return { name: error.name, message: error.message, sessionId: error.sessionId };
+  }
+  if (error instanceof SqliteSessionMutationConflictError) {
+    return { name: error.name, message: error.message, operationLabel: error.operationLabel };
+  }
+  if (error instanceof SessionEntryLifecycleUpsertConflictError) {
+    return { name: error.name, message: error.message, sessionKey: error.sessionKey };
+  }
+  if (error instanceof SessionPendingInputCustodyError) {
+    return { name: "SessionPendingInputCustodyError", message: error.message };
+  }
+  if (error instanceof SessionTranscriptWriterClaimReboundError) {
+    return {
+      name: error.name,
+      message: error.message,
+      refusal: parseTranscriptAppendRefusal(error.cause),
+    };
+  }
+  if (error instanceof BoardValidationError || error instanceof SessionGoalOperationError) {
     return { name: error.name, message: error.message, code: error.code };
   }
   return error instanceof Error
@@ -36,26 +79,31 @@ function errorFacts(error: unknown) {
     : { name: "Error", message: "Session actor storage command failed" };
 }
 
-/** Storage and phase commands share this owner's FIFO; every operation below is synchronous. */
+/** Storage, phase commands, and companion settlement share this owner's FIFO. */
 export function createSessionActorMemoryStorage(options: {
   agentId: string;
   path: string;
   target: SessionActorTarget;
   sessions: Map<string, SessionActorMemoryRecord>;
   current(): SessionActorMemoryState;
-  enqueue<T>(run: () => T): Promise<T>;
+  enqueue<T>(run: () => T | Promise<T>): Promise<T>;
   guards: SessionActorExecutorGuards;
+  acquire(this: void, sessionKey: string, lifetime?: SessionActorLifetime): Promise<SessionActor>;
+  prepareInstall(state: SessionActorMemoryState): void;
+  conversations(): SessionActorMemoryConversationOwner;
+  installConversations(value: SessionActorMemoryConversationOwner): void;
 }): SessionActorStorage {
   const { sessions, target } = options;
   const transaction = (authority: SessionActorStorageAuthority, writable: boolean) => {
     const before = options.current();
+    let conversations: SessionActorMemoryConversationOwner | undefined;
     const changed = new Map<string, SessionActorMemoryState | undefined>();
-    const authorized = new Set<string>();
+    const authorized = new Map<string, SessionActorMemoryState>();
     const authorize = (sessionKey: string, state: SessionActorMemoryState | undefined) => {
       if (state && !authorized.has(sessionKey)) {
         // Synchronous work uses one effect-policy check against the authoritative preimage.
         authority.authorize("commit", structuredClone(state.hot));
-        authorized.add(sessionKey);
+        authorized.set(sessionKey, state);
       }
     };
     const get = (sessionKey: string) => {
@@ -70,13 +118,10 @@ export function createSessionActorMemoryStorage(options: {
         throw new Error("Session actor read cannot mutate storage");
       }
       if (
-        !isIncognitoSessionKey(sessionKey) ||
         parseAgentSessionKey(sessionKey)?.agentId !== options.agentId ||
         toAgentStoreSessionKey({ agentId: options.agentId, requestKey: sessionKey }) !== sessionKey
       ) {
-        throw new Error(
-          "Memory session storage requires a canonical incognito key owned by this agent",
-        );
+        throw new Error("Memory session storage requires a canonical key owned by this agent");
       }
     };
     const edit = (sessionKey: string) => {
@@ -97,6 +142,15 @@ export function createSessionActorMemoryStorage(options: {
     const context: SessionActorMemoryStorageContext = {
       ...options,
       state,
+      get conversations() {
+        return conversations ?? options.conversations();
+      },
+      editConversations() {
+        if (!writable) {
+          throw new Error("Session actor read cannot mutate conversations");
+        }
+        return (conversations ??= cloneSessionActorMemoryConversations(options.conversations()));
+      },
       get,
       *entries() {
         const keys = new Set([...sessions.keys(), ...changed.keys()]);
@@ -120,31 +174,57 @@ export function createSessionActorMemoryStorage(options: {
         if (target.database.kind !== "memory") {
           throw new Error("Memory storage has no memory identity");
         }
-        return validateSessionActorMemorySources(get, target.database.incarnation, sources);
+        return validateSessionActorMemorySources(
+          get,
+          target.database.incarnation,
+          sources,
+          (query) => selectSessionActorMemoryConversations(context, query),
+        );
       },
     };
-    return { context, changed };
+    return {
+      context,
+      changed,
+      reauthorize: () => {
+        options.guards.assertAccepted();
+        for (const preimage of authorized.values()) {
+          authority.authorize("commit", structuredClone(preimage.hot));
+        }
+      },
+      installConversations: () => {
+        if (conversations) {
+          options.installConversations(conversations);
+        }
+      },
+    };
+  };
+  const readCurrent: SessionActorStorage["readCurrent"] = (query, authority) => {
+    options.guards.assertReadable();
+    const { context } = transaction(authority, false);
+    // SAFETY: readCurrent() receives the matching input for its query discriminator.
+    const selected = query as SessionActorStorageQuery;
+    const result = readSessionActorMemoryStorage(context, selected);
+    // SAFETY: The dispatcher returns this discriminator's declared output.
+    const value = result as SessionActorStorageReads[typeof query.type]["output"];
+    authority.assertCurrent();
+    return structuredClone(value);
   };
   return {
+    acquire: options.acquire,
+    readCurrent,
     read(query, authority) {
-      return options.enqueue(() => {
-        options.guards.assertReadable();
-        const { context } = transaction(authority, false);
-        // SAFETY: read() receives the matching input for its query discriminator.
-        const selected = query as SessionActorStorageQuery;
-        const result = readSessionActorMemoryStorage(context, selected);
-        // SAFETY: The dispatcher returns this discriminator's declared output.
-        const value = result as SessionActorStorageReads[typeof query.type]["output"];
-        authority.assertCurrent();
-        return structuredClone(value);
-      });
+      return options.enqueue(() => readCurrent(query, authority));
     },
     mutate(command, authority, observer) {
-      return options.enqueue(() => {
+      return options.enqueue(async () => {
         type Value = SessionActorStorageWrites[typeof command.type]["output"];
+        let outcome: SessionActorStorageOutcome<Value>;
         try {
           options.guards.assertAccepted();
-          const { context, changed } = transaction(authority, true);
+          const { context, changed, reauthorize, installConversations } = transaction(
+            authority,
+            true,
+          );
           // SAFETY: mutate() receives the matching input for its command discriminator.
           const selected = command as SessionActorStorageCommand;
           const result = mutateSessionActorMemoryStorage(context, selected, authority);
@@ -154,14 +234,31 @@ export function createSessionActorMemoryStorage(options: {
           for (const [sessionKey, state] of changed) {
             const previous = sessions.get(sessionKey)?.state;
             if (state) {
+              if (!isDeepStrictEqual(previous?.hot.entry, state.hot.entry)) {
+                syncSessionActorMemoryConversations(
+                  state,
+                  context.editConversations(),
+                  previous?.hot.entry,
+                );
+              }
+              options.prepareInstall(state);
               advanceSessionActorMemoryState(state);
             }
             changes.push({ sessionKey, before: previous?.hot, after: state?.hot });
           }
-          // No await follows admission; a callback's reentrant close may race this accepted install.
-          authority.assertCurrent();
           // Detach before installation: an uncloneable result cannot leave a partial commit.
-          const committed = structuredClone({ kind: "committed" as const, value, changes });
+          const committed = structuredClone({
+            kind: "committed" as const,
+            value,
+            changes,
+            ...(context.entryPatchEffects ? { entryPatchEffects: context.entryPatchEffects } : {}),
+          });
+          if (observer?.beforeCommit) {
+            await observer.beforeCommit(structuredClone(committed));
+            // Companion I/O can outlive permission; check the original preimage at the effect.
+            reauthorize();
+          }
+          authority.assertCurrent();
           for (const [sessionKey, state] of changed) {
             const previous = sessions.get(sessionKey);
             if (!state) {
@@ -183,16 +280,25 @@ export function createSessionActorMemoryStorage(options: {
               sessions.set(sessionKey, { state, closed: false });
             }
           }
-          const outcome: SessionActorStorageOutcome<Value> = committed;
+          installConversations();
+          outcome = committed;
           try {
-            observer?.committed(structuredClone(committed));
+            if (target.database.kind !== "memory") {
+              throw new Error("Memory storage lost its owner");
+            }
+            publishSessionActorMemoryChanges(
+              { ...options, incarnation: target.database.incarnation },
+              committed.changes,
+            );
+            observer?.committed?.(structuredClone(committed));
           } catch (error) {
             outcome.failure = errorFacts(error);
           }
-          return outcome;
         } catch (error) {
-          return { kind: "rolled-back", error: errorFacts(error) };
+          outcome = { kind: "rolled-back", error: errorFacts(error) };
         }
+        await observer?.settled?.(outcome);
+        return outcome;
       });
     },
   };

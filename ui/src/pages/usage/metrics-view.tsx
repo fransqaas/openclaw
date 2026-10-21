@@ -2,21 +2,30 @@ import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/st
 import { createMemo, For } from "solid-js";
 import { SettingsSection } from "../../components/solid/settings-ui.tsx";
 import { t } from "../../lib/reactive/i18n.ts";
-import { buildUsageMosaicStats, formatUsageTokens } from "./metrics.ts";
-import type { UsageSessionEntry } from "./types.ts";
+import type { SessionsUsageResult } from "./data-types.ts";
+import { formatUsageTokens } from "./metrics.ts";
 
 export function UsageMosaic(props: {
-  sessions: UsageSessionEntry[];
+  overview: SessionsUsageResult["overview"];
   timeZone: "local" | "utc";
   selectedHours: number[];
   onSelectHour: (hour: number, shiftKey: boolean) => void;
 }) {
   const state = createMemo(() => {
-    const sessions = props.sessions;
     const timeZone = props.timeZone;
     const selectedHours = props.selectedHours;
     const onSelectHour = props.onSelectHour;
-    const stats = buildUsageMosaicStats(sessions, timeZone);
+    // Spans from interrupted responses still count their recorded tokens, so totals are lower bounds.
+    const report = props.overview?.usageReport;
+    const stats = {
+      hasData: props.overview?.hasTimelineData ?? false,
+      totalTokens: props.overview?.hourTokens.reduce((sum, value) => sum + value, 0) ?? 0,
+      hourTotals: props.overview?.hourTokens ?? Array.from({ length: 24 }, () => 0),
+      weekdayTotals: ["sun", "mon", "tue", "wed", "thu", "fri", "sat"].map((day, index) => ({
+        label: t(`usage.mosaic.${day}`),
+        tokens: props.overview?.weekdayTokens[index] ?? 0,
+      })),
+    };
     const maxHour = Math.max(...stats.hourTotals, 1);
     const maxWeekday = Math.max(...stats.weekdayTotals.map((d) => d.tokens), 1);
 
@@ -26,7 +35,7 @@ export function UsageMosaic(props: {
         value > 0
           ? `color-mix(in srgb, var(--accent) ${(8 + intensity * 70).toFixed(1)}%, transparent)`
           : "transparent";
-      const title = `${hour}:00 · ${formatUsageTokens(value)} ${normalizeLowercaseStringOrEmpty(t("usage.metrics.tokens"))}`;
+      const title = `${hour}:00 · ${formatUsageTokens(value, report)} ${normalizeLowercaseStringOrEmpty(t("usage.metrics.tokens"))}`;
       const border =
         intensity > 0.7
           ? "color-mix(in srgb, var(--accent) 60%, transparent)"
@@ -34,7 +43,7 @@ export function UsageMosaic(props: {
       return { hour, bg, title, border, selected: selectedHours.includes(hour) };
     });
 
-    return { stats, timeZone, maxWeekday, hours, onSelectHour };
+    return { stats, timeZone, maxWeekday, hours, onSelectHour, report };
   });
   return (
     <SettingsSection
@@ -51,7 +60,7 @@ export function UsageMosaic(props: {
       }
       actions={
         <div class="usage-mosaic-total">
-          {formatUsageTokens(state().stats.hasData ? state().stats.totalTokens : 0)}{" "}
+          {formatUsageTokens(state().stats.hasData ? state().stats.totalTokens : 0, state().report)}{" "}
           {normalizeLowercaseStringOrEmpty(t("usage.metrics.tokens"))}
         </div>
       }
@@ -71,7 +80,9 @@ export function UsageMosaic(props: {
                     return (
                       <div class="usage-daypart-cell" style={{ background: bg() }}>
                         <div class="usage-daypart-label">{part.label}</div>
-                        <div class="usage-daypart-value">{formatUsageTokens(part.tokens)}</div>
+                        <div class="usage-daypart-value">
+                          {formatUsageTokens(part.tokens, state().report)}
+                        </div>
                       </div>
                     );
                   }}

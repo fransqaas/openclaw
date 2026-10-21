@@ -1,6 +1,6 @@
-// Finds and cleans stale gateway process ids.
 import { spawnSync } from "node:child_process";
 import path from "node:path";
+import { formatErrorMessage as formatRawErrorMessage } from "@openclaw/normalization-core/error-coercion";
 import { parseStrictPositiveInteger } from "@openclaw/normalization-core/number-coercion";
 import { uniqueValues } from "@openclaw/normalization-core/string-normalization";
 import { readProcessAncestry } from "@openclaw/proc-safe/identity";
@@ -121,7 +121,7 @@ function sleepSync(ms: number): void {
 /** Protect the caller and every known ancestor, including an unreadable parent, from cleanup. */
 export function inspectSelfAndAncestorPidsSync(
   _spawnTimeoutMs = PROCESS_INSPECTION_TIMEOUT_MS,
-  options: { requireVerifiedParent?: boolean } = {},
+  options: { requireVerifiedParent?: boolean; throughPid?: number } = {},
 ): { pids: Set<number>; complete: boolean } {
   const pids = new Set<number>([process.pid]);
   const immediateParent = process.ppid;
@@ -137,7 +137,10 @@ export function inspectSelfAndAncestorPidsSync(
     return { pids, complete: true };
   }
   try {
-    const ancestry = readProcessAncestry(process.pid, { maxDepth: MAX_ANCESTOR_WALK_DEPTH + 2 });
+    const ancestry = readProcessAncestry(process.pid, {
+      maxDepth: MAX_ANCESTOR_WALK_DEPTH + 2,
+      ...(options.throughPid === undefined ? {} : { throughPid: options.throughPid }),
+    });
     if (!ancestry) {
       return { pids, complete: false };
     }
@@ -563,7 +566,8 @@ export function cleanStaleGatewayProcessesSync(
     // Even an already-exited PID can leave its socket bound briefly; always join port release.
     waitForPortFreeSync(port);
     return killed;
-  } catch {
+  } catch (error) {
+    restartLog.warn(`stale gateway process cleanup failed: ${formatRawErrorMessage(error)}`);
     return [];
   }
 }

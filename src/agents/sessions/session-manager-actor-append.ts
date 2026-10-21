@@ -6,12 +6,12 @@ import type {
   SessionActorOutcome,
   SessionActorPhaseResults,
 } from "../../config/sessions/session-actor-contract.js";
-import { runSessionActorCommand } from "../../config/sessions/session-actor-scope.js";
 import { SqliteTranscriptMutationConflictError } from "../../config/sessions/session-mutation-conflict-error.js";
 import { SessionTranscriptWriterClaimReboundError } from "../../config/sessions/session-transcript-writer-claim-error.js";
 import {
   hasSqliteWorkerOutcomeUnknown,
   SqliteWorkerError,
+  wrapSqliteWorkerError,
 } from "../../infra/sqlite-worker-contract.js";
 import { recordModelFallbackStop } from "../model-fallback-stop.js";
 import { captureSessionMessageAdmission } from "./session-manager-message-admission.js";
@@ -69,17 +69,12 @@ export async function appendSessionManagerActor(input: {
         }
       },
     };
-    outcome = await runSessionActorCommand<AppendValue>(actor, authority, (snapshot) => {
-      const command = {
-        commandId: randomUUID(),
-        phaseId: "session-manager.append",
-        expected: snapshot?.version,
-        append,
-      };
-      return input.toolResult
-        ? actor.appendToolResult(command, authority, observer)
-        : actor.appendTranscriptEvent(command, authority, observer);
-    });
+    // The worker selects the current actor version under its writer FIFO;
+    // the prepared append carries its own transcript and live-authority predicates.
+    const command = { commandId: randomUUID(), phaseId: "session-manager.append", append };
+    outcome = input.toolResult
+      ? await actor.appendToolResult(command, authority, observer)
+      : await actor.appendTranscriptEvent(command, authority, observer);
   } catch (cause) {
     if (!captured) {
       if (hasSqliteWorkerOutcomeUnknown(cause)) {
@@ -98,7 +93,7 @@ export async function appendSessionManagerActor(input: {
     return finish(captured, new Error("Session actor reply contradicted its captured commit"));
   }
   if (outcome.kind === "unknown") {
-    const error = new SqliteWorkerError(outcome.error.message, "outcome-unknown");
+    const error = wrapSqliteWorkerError(outcome.error.message, "outcome-unknown", outcome.error);
     recordModelFallbackStop(error);
     throw error;
   }

@@ -36,7 +36,7 @@ import type { FinalizedMsgContext } from "openclaw/plugin-sdk/reply-runtime";
 import { resolveInboundLastRouteSessionKey } from "openclaw/plugin-sdk/routing";
 import { logVerbose, shouldLogVerbose } from "openclaw/plugin-sdk/runtime-env";
 import { resolvePinnedMainDmOwnerFromAllowlist } from "openclaw/plugin-sdk/security-runtime";
-import { getSessionEntry, resolveStorePath } from "openclaw/plugin-sdk/session-store-runtime";
+import { getSessionEntryAsync, resolveStorePath } from "openclaw/plugin-sdk/session-store-runtime";
 import {
   asOptionalRecord as asRecord,
   normalizeLowercaseStringOrEmpty,
@@ -70,6 +70,7 @@ import {
 } from "../context.js";
 import { authorizeSlackDirectMessage } from "../dm-auth.js";
 import type { SlackEventScope } from "../event-scope.js";
+import { getOrCreateWeakOwnerMap } from "../lru-map-cache.js";
 import type { SlackMediaResult } from "../media-types.js";
 import { escapeSlackMrkdwn } from "../mrkdwn.js";
 import { resolveSlackRoomContextHints } from "../room-context.js";
@@ -118,7 +119,6 @@ function mergeSlackAssistantThreadContext(
   return {
     assistantChannelId: primary.assistantChannelId || fallback.assistantChannelId,
     threadTs: primary.threadTs || fallback.threadTs,
-    userId: primary.userId ?? fallback.userId,
     channelId: primary.channelId ?? fallback.channelId,
     teamId: primary.teamId ?? fallback.teamId,
     enterpriseId: primary.enterpriseId !== undefined ? primary.enterpriseId : fallback.enterpriseId,
@@ -147,7 +147,6 @@ function resolveSlackMessageAssistantThreadContext(
   return {
     assistantChannelId,
     threadTs,
-    userId: normalizeOptionalString(thread.user_id) ?? message.user,
     channelId: normalizeOptionalString(context?.channel_id),
     teamId: normalizeOptionalString(context?.team_id),
     enterpriseId:
@@ -175,7 +174,6 @@ async function restoreSlackAssistantThreadContextFromMetadata(params: {
       client: params.eventScope?.client ?? params.ctx.app.client,
       channelId: params.message.channel,
       threadTs,
-      userId: params.message.user,
     });
   } catch (err) {
     logVerbose(
@@ -196,11 +194,7 @@ function resolveCachedMentionRegexes(
     normalizeOptionalString(options?.conversationId ?? undefined),
     options?.providerPolicy ? JSON.stringify(options.providerPolicy) : "",
   ].join("\u001f");
-  let byAgent = mentionRegexCache.get(ctx);
-  if (!byAgent) {
-    byAgent = new Map<string, RegExp[]>();
-    mentionRegexCache.set(ctx, byAgent);
-  }
+  const byAgent = getOrCreateWeakOwnerMap(mentionRegexCache, ctx);
   const cached = byAgent.get(key);
   if (cached) {
     return cached;
@@ -707,7 +701,7 @@ export async function prepareSlackMessage(params: {
   const hasBoundSession = Boolean(
     routing.runtimeBoundSessionKey || routing.configuredBindingSessionKey,
   );
-  const { configuredBinding, configuredBindingSessionKey } = routing;
+  const { configuredBinding } = routing;
   const isAssistantThreadMessage = Boolean(isDirectMessage && messageAssistantThreadContext);
   const shouldForceAssistantReplyThread = Boolean(
     assistantThreadContext?.threadTs &&
@@ -717,23 +711,12 @@ export async function prepareSlackMessage(params: {
     ? assistantThreadContext?.threadTs
     : undefined;
   const forcedReplyThreadTs = agentViewThreadTs ?? forcedAssistantReplyThreadTs;
-  if (routing.runtimeBinding && shouldLogVerbose()) {
-    logVerbose(
-      `slack: routed via bound conversation ${routing.runtimeBinding.conversation.conversationId} -> ${routing.runtimeBinding.targetSessionKey}`,
-    );
-  }
   if (configuredBinding) {
     const ensured = await ensureConfiguredBindingRouteReady({
       cfg,
       bindingResolution: configuredBinding,
     });
-    if (ensured.ok) {
-      if (shouldLogVerbose()) {
-        logVerbose(
-          `slack: using configured ACP binding for ${configuredBinding.record.conversation.conversationId} -> ${configuredBindingSessionKey}`,
-        );
-      }
-    } else {
+    if (!ensured.ok) {
       if (shouldLogVerbose()) {
         logVerbose(
           `slack: configured ACP binding unavailable for ${configuredBinding.record.conversation.conversationId}: ${ensured.error}`,
@@ -810,8 +793,7 @@ export async function prepareSlackMessage(params: {
   const textForCommandDetection = stripSlackMentionsForCommandDetection(message.text ?? "");
   const hasControlCommandInMessage = hasControlCommand(textForCommandDetection, cfg);
   const hasAbortRequest = isAbortRequestText(textForCommandDetection);
-  const channelUsersAllowlistConfigured =
-    isRoom && Array.isArray(channelConfig?.users) && channelConfig.users.length > 0;
+  const channelUsersAllowlistConfigured = isRoom && (channelConfig?.users?.length ?? 0) > 0;
   const resolveMessageIngress = async (
     contextBinding?: import("openclaw/plugin-sdk/channel-ingress-runtime").ChannelIngressContextBinding,
     threadId?: string,
@@ -1200,7 +1182,7 @@ export async function prepareSlackMessage(params: {
   if (messageIngress.ingress.admission !== "dispatch") {
     return drop("final-route-denied");
   }
-  const sessionEntry = getSessionEntry({
+  const sessionEntry = await getSessionEntryAsync({
     storePath,
     sessionKey,
   });
@@ -1209,19 +1191,10 @@ export async function prepareSlackMessage(params: {
   if (message.ts) {
     excludedMessageIds.add(message.ts);
   }
-  const isHistorySessionCurrent = () => {
-    const current = getSessionEntry({ storePath, sessionKey });
-    return (
-      current?.sessionId === sessionEntry?.sessionId &&
-      current?.lifecycleRevision === sessionEntry?.lifecycleRevision &&
-      current?.sessionStartedAt === sessionEntry?.sessionStartedAt &&
-      (current?.updatedAt === 0) === (sessionEntry?.updatedAt === 0)
-    );
-  };
   const assertHistoryCurrent = () => {
     opts.abortSignal?.throwIfAborted();
-    if (opts.isRuntimePolicyCurrent?.() === false || !isHistorySessionCurrent()) {
-      throw new Error("Slack history policy or session changed during recovery");
+    if (opts.isRuntimePolicyCurrent?.() === false) {
+      throw new Error("Slack history policy changed during recovery");
     }
   };
   const dmHistoryLimit = isDirectMessage
@@ -1294,7 +1267,8 @@ export async function prepareSlackMessage(params: {
     abortSignal: opts.abortSignal,
   });
   const { threadLabel, threadStarterMedia } = threadContextData;
-  let { threadStarterBody, threadHistoryBody, shouldSeedInitialThreadContext } = threadContextData;
+  const { threadStarterBody, threadHistoryBody, shouldSeedInitialThreadContext } =
+    threadContextData;
   const threadScopedHistory = isThreadReply && ctx.threadHistoryScope === "thread";
   let roomHistory: HistoryEntry[] = [];
   if (
@@ -1321,26 +1295,13 @@ export async function prepareSlackMessage(params: {
   }
 
   const effectiveMedia = effectiveDirectMedia ?? threadStarterMedia;
-  let inboundMedia = await toInboundMediaFactsWithMetadata(effectiveMedia, {
+  const inboundMedia = await toInboundMediaFactsWithMetadata(effectiveMedia, {
     transcribed: (entry) =>
       effectiveMedia === effectiveDirectMedia && entry === preflightAudioMedia,
   });
   opts.abortSignal?.throwIfAborted();
   if (opts.isRuntimePolicyCurrent?.() === false) {
     return drop("final-route-denied");
-  }
-  if (isRoomish && ctx.historyLimit > 0 && !isHistorySessionCurrent()) {
-    roomHistory = [];
-    threadHistoryBody = undefined;
-    threadStarterBody = undefined;
-    shouldSeedInitialThreadContext = false;
-    if (effectiveMedia === threadStarterMedia) {
-      inboundMedia = [];
-    }
-    ctx.logger.warn(
-      { channelId: message.channel, sessionKey },
-      "Slack automatic history omitted after session changed",
-    );
   }
   combinedBody = buildHistoryContextFromEntries({
     entries: roomHistory,
@@ -1527,12 +1488,6 @@ export async function prepareSlackMessage(params: {
       originatingTo: preflightChannelTarget,
       messageThreadId: threadContext.messageThreadId,
     });
-  }
-
-  if (shouldLogVerbose()) {
-    logVerbose(
-      `slack inbound: account=${route.accountId} agent=${route.agentId} channel=${message.channel} message_ts=${message.ts ?? "unknown"} thread_ts=${effectiveMessageThreadId ?? "none"} from=${slackFrom} chat=${chatType} chars=${rawBody.length}`,
-    );
   }
 
   const updateLastRouteSessionKey = resolveInboundLastRouteSessionKey({ route, sessionKey });

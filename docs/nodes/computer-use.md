@@ -52,6 +52,8 @@ The built-in tool uses the Gateway desktop from an agent run hosted by that Gate
 
 Tool discovery reads declared capabilities and recorded runtime health without starting a desktop or waiting for its helper. The first computer action probes the selected Gateway and binds to the resulting live provider generation. A declared action list alone does not mean the desktop is ready.
 
+Hosted agent turns reuse the Gateway's prepared node catalog and computer-provider declarations. Pairing and connection changes, command-policy updates, and provider/configuration changes update those owner-held facts before the next turn assembles its tool surface. Discovery remains bound to the agent's Gateway; a retired Gateway binding cannot borrow another Gateway's inventory.
+
 For RPC clients, `computer.status` with `probe: false` performs this passive read. `probe: true` prepares the computer and waits for readiness; omitting `probe` preserves that behavior for existing clients. Concurrent probes share preparation, and helper startup remains bounded by its one-minute timeout. Passive reads never extend the desktop's idle lifetime or retry a failed startup.
 
 ### Linux Gateway live proof
@@ -285,6 +287,13 @@ On macOS, default-on means a paired gateway can drive pointer and keyboard input
 `gateway.nodes.commands.deny` remains an explicit global revocation and always wins; a denied `computer.act` is withheld from the node's advertised surface together with its `computer` capability, and the Gateway records what it withheld. No fulfiller needs a `gateway.nodes.commands.allow` entry: `computer.act` is a built-in desktop platform default, so node-local enablement plus pairing approval is the whole grant on every platform and for either fulfiller. An authenticated operator with `operator.write` can invoke an enabled, paired command through `node.invoke`; there is no per-action admin check.
 
 ## Safety
+
+OpenClaw hides its native macOS human-approval panels from Peekaboo screen snapshots
+and refuses native computer input while an approval panel or menu-bar approval is
+pending. Human clicks and **Command-Return** still work. These native guards do not
+cover browser automation, the separate CUA driver, or third-party automation on
+the same machine. This is hardening, not an isolation boundary. Do not combine
+ask-mode exec with unrestricted computer use for a model you do not trust.
 
 - Tool policy, local provider enablement, and platform permissions must agree. Node targets also require Gateway command policy, pairing, and node-app settings. On macOS that includes **Allow Computer Control**, Accessibility, and Screen Recording; the native Peekaboo path also requires Event Posting. Actions execute while those durable controls remain enabled; there is no per-action confirmation.
 - The macOS fulfiller posts text one grapheme at a time, so cancellation, disconnect, pause, disable, or endpoint replacement stops it before the next grapheme. The experimental CUA Driver fulfiller passes node cancellation to the SDK for each call.

@@ -67,8 +67,10 @@ export function getBeforeToolCallPolicyDiagnosticState(): BeforeToolCallPolicyDi
 }
 
 export function hasBeforeToolCallPolicy(): boolean {
-  const state = getBeforeToolCallPolicyDiagnosticState();
-  return state.hasBeforeToolCallHook || state.trustedToolPolicies.length > 0;
+  return (
+    getGlobalHookRunner()?.hasHooks("before_tool_call") === true ||
+    hasTrustedToolPolicies(getGlobalHookRunnerRegistry() ?? undefined)
+  );
 }
 
 export async function runBeforeToolCallHook(args: {
@@ -92,6 +94,10 @@ export async function runBeforeToolCallHook(args: {
   };
   let releaseArgumentChurnPolicyWait: (() => void) | undefined;
 
+  if (args.ctx?.awaitSessionDiffBaseline) {
+    await args.ctx.awaitSessionDiffBaseline();
+    args.signal?.throwIfAborted();
+  }
   try {
     if (args.ctx?.sessionKey) {
       if (args.ctx.loopDetection?.enabled === true) {

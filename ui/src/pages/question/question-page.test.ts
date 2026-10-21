@@ -1,5 +1,6 @@
 /* @vitest-environment jsdom */
 
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import { GatewayRequestError } from "../../api/gateway.ts";
@@ -13,12 +14,12 @@ import {
   createTestGatewayClient,
   type GatewayRequestHandler,
 } from "../../test-helpers/gateway-client.ts";
+import { waitForSolid } from "../../test-helpers/solid-settle.ts";
 import { questionPanelIn } from "../chat/components/chat-question-card.test-support.ts";
-import { QuestionPage } from "./question-page.ts";
+import "./question-page-registration.ts";
 
-// Keep the registered page paired with this module's context in the shared UI runner.
-const tag = `test-question-page-${crypto.randomUUID()}`;
-customElements.define(tag, class extends QuestionPage {});
+const tag = "openclaw-question-page";
+type QuestionPage = HTMLElementTagNameMap[typeof tag];
 
 function question(id = "question-one") {
   return {
@@ -49,7 +50,7 @@ function mount(request: GatewayRequestHandler) {
     phase: "connected",
   });
   const provider = createApplicationContextProvider({ gateway } as ApplicationContext);
-  const page = document.createElement(tag) as QuestionPage;
+  const page = document.createElement(tag);
   page.questionId = "question-one";
   provider.append(page);
   document.body.append(provider);
@@ -80,6 +81,33 @@ beforeEach(async () => {
 afterEach(() => {
   document.body.replaceChildren();
 });
+
+it.each(["question", "outside"] as const)(
+  "restores focus after removing a question only when it held focus (%s)",
+  async (focusAt) => {
+    const request = vi.fn().mockResolvedValue({ question: question() });
+    const { page } = mount(request);
+    await settle(page);
+    await questionPanelIn(page);
+    const input = page.querySelector("textarea")!;
+    const outside = document.body.appendChild(document.createElement("button"));
+    const target = focusAt === "question" ? input : outside;
+    target.focus();
+    expect(document.activeElement).toBe(target);
+
+    page.questionId = "";
+    await settle(page);
+
+    await waitForSolid(() => {
+      expect(input.isConnected).toBe(false);
+      expect(document.activeElement).toBe(
+        focusAt === "question" ? page.querySelector("#question-page-title") : outside,
+      );
+    });
+    expect(page.textContent).toContain("Unavailable");
+    expect(request).toHaveBeenCalledTimes(1);
+  },
+);
 
 it("recovers a failed reconnect lookup without losing the typed answer", async () => {
   const request = vi
@@ -117,7 +145,8 @@ it("recovers a failed reconnect lookup without losing the typed answer", async (
     },
     expect.any(Object),
   );
-  expect(page.textContent).toContain("Answered");
+  await waitForSolid(() => expect(page.textContent).toContain("Answered"));
+  expect(page.querySelector(".chat-question-summary")?.textContent).toContain("The design team");
 });
 
 it.each(["id", "client"] as const)(
@@ -163,4 +192,27 @@ it("keeps confirmed missing questions unavailable without a retry", async () => 
   await settle(page);
   expect(page.textContent).toContain("Unavailable");
   expect(retry(page)).toBeUndefined();
+});
+
+it("loads only the final question when native IDs change in one turn", async () => {
+  const request = vi.fn(async (_method: string, params?: unknown) => {
+    if (!isRecord(params) || typeof params.id !== "string") {
+      throw new Error("Expected a question ID");
+    }
+    return { question: question(params.id) };
+  });
+  const { page } = mount(request);
+  await settle(page);
+  await questionPanelIn(page);
+
+  page.questionId = "question-two";
+  page.questionId = "question-three";
+  await settle(page);
+  await questionPanelIn(page);
+
+  expect(request.mock.calls.map(([, params]) => params)).toEqual([
+    { id: "question-one" },
+    { id: "question-three" },
+  ]);
+  expect(page.textContent).toContain("Who should receive question-three?");
 });

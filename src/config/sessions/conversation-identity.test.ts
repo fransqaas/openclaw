@@ -2,11 +2,8 @@ import { describe, expect, it } from "vitest";
 import { normalizeLegacySessionEntryDelivery } from "../../infra/state-migrations.legacy-session-store.js";
 import type { ChannelRouteRef } from "../../plugin-sdk/channel-route.js";
 import type { DeliveryContext } from "../../utils/delivery-context.types.js";
-import {
-  buildConversationIdentity,
-  conversationIdentityFromMsgContext,
-  conversationIdentityFromSessionEntry as conversationIdentityFromCanonicalSessionEntry,
-} from "./conversation-identity.js";
+import { conversationIdentityFromMsgContext } from "./conversation-identity-inbound.js";
+import { conversationIdentityFromSessionEntry as conversationIdentityFromCanonicalSessionEntry } from "./conversation-identity.js";
 import type { SessionEntry, SessionOrigin } from "./types.js";
 
 type LegacyDeliveryFixture = SessionEntry & {
@@ -79,15 +76,7 @@ describe("conversation identity", () => {
       nativeDirectUserId: "canonical-peer-123",
       peerId: "canonical-peer-123",
     });
-    expect(identity?.conversationRef).toBe(
-      buildConversationIdentity({
-        channel: "discord",
-        accountId: "default",
-        kind: "direct",
-        peerId: "canonical-peer-123",
-        deliveryTarget: "user:delivery-alias-456",
-      })?.conversationRef,
-    );
+    expect(identity?.conversationRef).toBe("conv_a97f28e8d3dd98471fb5d4127b1e8635");
   });
 
   it("keeps fallback origin targets paired with their origin channel", () => {

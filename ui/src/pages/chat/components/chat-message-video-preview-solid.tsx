@@ -1,8 +1,9 @@
 import type { JSX } from "@solidjs/web";
-import { Show, createSignal, onCleanup, onSettled } from "solid-js";
+import { Show, createSignal, onSettled, useContext } from "solid-js";
 import { Icon } from "../../../components/solid/icon.tsx";
 import { requestVideoPoster } from "../../../lib/media/video-poster.ts";
 import { t } from "../../../lib/reactive/i18n.ts";
+import { ContentPresentation } from "../../../lib/solid/presentation.ts";
 import { observeChatAttachmentViewport } from "./chat-attachment-viewport.ts";
 
 export type VideoPreviewProps = {
@@ -22,13 +23,53 @@ export function MessageVideoPreview(props: VideoPreviewProps): JSX.Element {
 }
 
 function VideoPreviewContent(props: VideoPreviewProps): JSX.Element {
-  const [posterUrl, setPosterUrl] = createSignal<string>();
+  const presented = useContext(ContentPresentation);
   const [failed, setFailed] = createSignal(false);
+  let button!: HTMLButtonElement;
+  return (
+    <div class="chat-video-preview__content">
+      <Show when={!failed()} fallback={props.fallback}>
+        <button
+          ref={(element) => {
+            button = element;
+          }}
+          type="button"
+          class="chat-message-image-button"
+          aria-label={`${t("chat.attachments.open")}: ${props.label}`}
+          onClick={() => props.onOpen()}
+        >
+          <Show
+            when={presented()}
+            fallback={<span class="chat-message-image chat-video-preview__placeholder" />}
+          >
+            <VideoPoster
+              key={props.key}
+              src={props.src}
+              label={props.label}
+              getTarget={() => button}
+              onFailed={() => setFailed(true)}
+            />
+          </Show>
+          <span class="chat-video-preview__play" aria-hidden="true">
+            <Icon name="play" />
+          </span>
+        </button>
+      </Show>
+    </div>
+  );
+}
+
+function VideoPoster(props: {
+  key: string;
+  src: string;
+  label: string;
+  getTarget: () => HTMLElement;
+  onFailed: () => void;
+}): JSX.Element {
+  const [posterUrl, setPosterUrl] = createSignal<string>();
+  let active = true;
   let controller: AbortController | undefined;
   let currentPoster: string | undefined;
-  let visible = false;
-  let disposed = false;
-  let element!: HTMLDivElement;
   const release = () => {
     controller?.abort();
     controller = undefined;
@@ -36,10 +77,9 @@ function VideoPreviewContent(props: VideoPreviewProps): JSX.Element {
       URL.revokeObjectURL(currentPoster);
     }
     currentPoster = undefined;
-    setPosterUrl(undefined);
   };
   const requestPoster = () => {
-    if (disposed || !visible || controller || failed()) {
+    if (!active || controller) {
       return;
     }
     const request = new AbortController();
@@ -51,71 +91,47 @@ function VideoPreviewContent(props: VideoPreviewProps): JSX.Element {
       height: 225,
       signal: request.signal,
     }).then((blob) => {
-      if (disposed || request !== controller || request.signal.aborted || !visible) {
+      // Hiding, parking, or disposal aborts this request through release().
+      if (request.signal.aborted) {
         return;
       }
       if (blob) {
         currentPoster = URL.createObjectURL(blob);
         setPosterUrl(currentPoster);
       } else {
-        setFailed(true);
+        props.onFailed();
       }
     });
   };
-  onSettled(() =>
-    observeChatAttachmentViewport(
-      element,
-      () => {
-        visible = true;
-        requestPoster();
-      },
-      () => {
-        visible = false;
+  onSettled(() => {
+    const stopObserving = observeChatAttachmentViewport(props.getTarget(), requestPoster, () => {
+      if (active) {
         release();
-      },
-    ),
-  );
-  onCleanup(() => {
-    disposed = true;
-    release();
+        setPosterUrl(undefined);
+      }
+    });
+    return () => {
+      active = false;
+      stopObserving();
+      release();
+    };
   });
   return (
-    <div
-      class="chat-video-preview__content"
-      ref={(value) => {
-        element = value;
-      }}
+    <Show
+      when={posterUrl()}
+      fallback={<span class="chat-message-image chat-video-preview__placeholder" />}
     >
-      <Show when={!failed()} fallback={props.fallback}>
-        <button
-          type="button"
-          class="chat-message-image-button"
-          aria-label={`${t("chat.attachments.open")}: ${props.label}`}
-          onClick={() => props.onOpen()}
-        >
-          <Show
-            when={posterUrl()}
-            fallback={<span class="chat-message-image chat-video-preview__placeholder" />}
-          >
-            {(url) => (
-              <img
-                class="chat-message-image"
-                src={url()}
-                alt={props.label}
-                onError={() => {
-                  if (!disposed && currentPoster === url()) {
-                    release();
-                    setFailed(true);
-                  }
-                }}
-              />
-            )}
-          </Show>
-          <span class="chat-video-preview__play" aria-hidden="true">
-            <Icon name="play" />
-          </span>
-        </button>
-      </Show>
-    </div>
+      {(url) => (
+        <img
+          class="chat-message-image"
+          src={url()}
+          alt={props.label}
+          onError={() => {
+            release();
+            props.onFailed();
+          }}
+        />
+      )}
+    </Show>
   );
 }

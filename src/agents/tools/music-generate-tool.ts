@@ -2,8 +2,8 @@ import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/s
 import { Type } from "typebox";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { parseMusicGenerationModelRef } from "../../media-generation/model-ref.js";
+import { listMusicGenerationProviders } from "../../media-generation/registry.js";
 import { resolveGeneratedMediaMaxBytes } from "../../media/configured-max-bytes.js";
-import { listRuntimeMusicGenerationProviders } from "../../music-generation/runtime.js";
 import type { MusicGenerationOutputFormat } from "../../music-generation/types.js";
 import { readBooleanParam } from "../../plugin-sdk/boolean-param.js";
 import { buildMediaGenerationRequestKey } from "../media-generation-task-status-shared.js";
@@ -92,8 +92,16 @@ function normalizeOutputFormat(raw: string | undefined): MusicGenerationOutputFo
   throw new ToolInputError('format must be one of "mp3" or "wav"');
 }
 
-export function createMusicGenerateTool(options?: MediaGenerateToolOptions): AnyAgentTool | null {
-  const context = resolveMediaGenerateToolContext("musicGenerationProviders", options, log);
+export function createMusicGenerateTool(
+  options?: MediaGenerateToolOptions,
+  preparedAvailability?: boolean,
+): AnyAgentTool | null {
+  const context = resolveMediaGenerateToolContext(
+    "musicGenerationProviders",
+    options,
+    log,
+    preparedAvailability,
+  );
   if (!context) {
     return null;
   }
@@ -128,7 +136,7 @@ export function createMusicGenerateTool(options?: MediaGenerateToolOptions): Any
                 })
               : undefined,
           resolveProviders: (acquired) =>
-            acquired?.providers ?? (() => listRuntimeMusicGenerationProviders({ config: cfg })),
+            acquired?.providers ?? (() => listMusicGenerationProviders(cfg)),
           prepare: async ({
             resources: acquired,
             modelConfig: musicGenerationModelConfig,
@@ -163,8 +171,7 @@ export function createMusicGenerateTool(options?: MediaGenerateToolOptions): Any
               (model === undefined && !primaryModelRef);
             const selectedProvider = shouldResolveSelectedProvider
               ? resolveSelectedCapabilityProvider({
-                  providers:
-                    providers ?? listRuntimeMusicGenerationProviders({ config: effectiveCfg }),
+                  providers: providers ?? listMusicGenerationProviders(effectiveCfg),
                   modelConfig: musicGenerationModelConfig,
                   modelOverride: model,
                 })
@@ -198,6 +205,7 @@ export function createMusicGenerateTool(options?: MediaGenerateToolOptions): Any
             acquired?.assertOpen();
             const remoteMediaSsrfPolicy = effectiveCfg.tools?.web?.fetch?.ssrfPolicy;
             const loadedReferenceImages = await loadMediaToolReferences({
+              workspaceReadiness: context.workspaceReadiness,
               inputs: imageInputs,
               toolName: "music_generate",
               expectedKind: "image",
@@ -257,6 +265,7 @@ export function createMusicGenerateTool(options?: MediaGenerateToolOptions): Any
                       timeoutMs,
                     },
                     filename,
+                    sandbox: context.acquireOutputSandbox,
                     loadedReferenceImages,
                     taskHandle,
                     timeoutNormalization: timeout.normalization,

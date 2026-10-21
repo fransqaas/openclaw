@@ -10,7 +10,6 @@ import type {
   MattermostInteractionResponse,
 } from "./interactions.js";
 import {
-  buildMattermostAllowedModelRefs,
   parseMattermostModelPickerContext,
   renderMattermostModelsPickerView,
   renderMattermostProviderPickerView,
@@ -182,6 +181,7 @@ export function createMattermostModelPickerInteractionHandler(
         cfg,
         route: modelSessionRoute,
         data,
+        sessionEntry,
       });
       const viewParams = {
         ownerUserId: pickerState.ownerUserId,
@@ -200,7 +200,10 @@ export function createMattermostModelPickerInteractionHandler(
     }
 
     const targetModelRef = `${pickerState.provider}/${pickerState.model}`;
-    if (!buildMattermostAllowedModelRefs(data).has(targetModelRef)) {
+    if (
+      !data.providers.includes(pickerState.provider) ||
+      !data.byProvider.get(pickerState.provider)?.has(pickerState.model)
+    ) {
       return { ephemeral_text: `That model is no longer available: ${targetModelRef}` };
     }
 
@@ -238,7 +241,11 @@ export function createMattermostModelPickerInteractionHandler(
         cfg,
         route: modelSessionRoute,
         data,
-        readConsistency: "latest",
+        sessionEntry: await getSessionEntryAsync({
+          agentId: modelSessionRoute.agentId,
+          storePath: resolveStorePath(cfg.session?.store, { agentId: modelSessionRoute.agentId }),
+          sessionKey: modelSessionRoute.sessionKey,
+        }),
       });
       const view = renderMattermostModelsPickerView({
         ownerUserId: pickerState.ownerUserId,

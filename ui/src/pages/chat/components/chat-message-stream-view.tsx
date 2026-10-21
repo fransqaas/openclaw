@@ -10,32 +10,27 @@ import { resolveToolDisplay } from "../../../lib/chat/tool-display.ts";
 import { formatDurationLong } from "../../../lib/format-duration.ts";
 import { t } from "../../../lib/reactive/i18n.ts";
 import "../../../components/tooltip.ts";
-import {
-  emptyLegacyContent as litNothing,
-  LitContent,
-  type LegacyTemplateResult,
-} from "../../../lit/solid-content.tsx";
-import { renderChatAvatar } from "../chat-avatar.ts";
+import { ChatAvatar, type ChatAvatarProps } from "../chat-avatar-view.tsx";
 import type { ChatSubagentWait } from "../chat-subagent-wait.ts";
-import { ChatBubbleDots } from "./chat-bubble-activity-view.tsx";
-import type { GroupedMessageOptions } from "./chat-message-bubble-options.ts";
+import type { MessageRenderOptions } from "./chat-message-bubble-options.ts";
 import { GroupedMessage } from "./chat-message-bubble-view.tsx";
 import {
   prepareChatMessageRender,
   resolveMessageActionDetails,
 } from "./chat-message-markdown-view.tsx";
 import { ChatTimestamp } from "./chat-message-timestamp-view.tsx";
-import { renderChatQuestionSummary } from "./chat-question-card.ts";
-import {
-  renderReplyLine,
-  renderReplyLineConnector,
-  resolveGroupReplyLine,
-} from "./chat-reply-attribution.ts";
+import { ChatQuestionSummary } from "./chat-question-summary.tsx";
+import { resolveGroupReplyLine } from "./chat-reply-attribution.ts";
+import { ReplyLineView, ReplyLineConnector } from "./chat-reply-attribution.tsx";
+import type { ReplyConnectorElements } from "./chat-reply-connector.ts";
 import type { ReplyPreviewLookup } from "./chat-reply-preview.types.ts";
 import type { SidebarContent } from "./chat-sidebar-content-types.ts";
-import { syncToolDisclosureOverflow } from "./chat-tool-cards.ts";
-import { renderToolOutcomeSummary } from "./chat-tool-outcome-summary.ts";
-import { renderChatWorkingIndicator } from "./chat-working-indicator.ts";
+import type { SubagentActivityProps } from "./chat-subagent-activity.ts";
+import { BrowserTabPreviews, syncToolDisclosureOverflow } from "./chat-tool-cards.solid.tsx";
+import type { BrowserTabPreview } from "./chat-tool-cards.ts";
+import { ToolOutcomeSummary } from "./chat-tool-outcome-summary.solid.tsx";
+import { summarizeToolCardOutcomes } from "./chat-tool-render-model.ts";
+import { ChatWorkingIndicator } from "./chat-working-indicator.tsx";
 
 /** A contiguous run of in-flight streaming items rendered under one assistant group. */
 export type StreamGroupPart = Extract<
@@ -43,63 +38,25 @@ export type StreamGroupPart = Extract<
   { kind: "stream" } | { kind: "reading-indicator" } | { kind: "question" }
 >;
 
-type StreamMessageOptions = Pick<
-  GroupedMessageOptions,
-  | "onOpenReply"
-  | "replyNavigationId"
-  | "sessionKey"
-  | "presented"
-  | "boardProvider"
-  | "agentId"
-  | "runActive"
-  | "asyncQuestions"
-  | "onRequestUpdate"
-  | "canvasPluginSurfaceUrl"
-  | "resourceBasePath"
-  | "mediaPolicyKey"
-  | "connectionEpoch"
-  | "assistantAttachmentAuthToken"
-  | "resolveArtifactDownload"
-  | "getTurnVideoMessages"
-  | "onRequestOpenImage"
-  | "onOpenImage"
-  | "onAssistantAttachmentLoaded"
-  | "embedSandboxMode"
-  | "allowExternalEmbedUrls"
-  | "fetchLinkFavicon"
-  | "pluginToolIcons"
-  | "githubRepo"
-  | "githubRepositories"
-  | "onOpenWorkspaceFile"
->;
-
-export type StreamGroupOptions = StreamMessageOptions & {
+export type StreamGroupOptions = MessageRenderOptions & {
   resolveReplyPreview?: ReplyPreviewLookup;
   branding?: ThemeBranding;
   bubbleMode?: boolean;
-  entryRefFor?: (key: string) => ((element?: Element) => void) | undefined;
+  firstBubbleKey?: string | null;
   onReply?: (target: ChatReplyTarget) => void;
   onOpenSidebar?: (content: SidebarContent) => void;
-  assistant?: Parameters<typeof renderChatAvatar>[1];
+  assistant?: ChatAvatarProps["assistant"];
   showAssistantAvatar?: boolean;
   startupLabel?: string;
+  retryAt?: number;
   waitingApproval?: boolean;
   waitingSubagents?: ChatSubagentWait;
   runningSubagents?: number;
-  subagentActivity?: LegacyTemplateResult;
-  onOpenSubagent?: (key: string) => void;
+  subagentActivity?: SubagentActivityProps;
   onOpenSubagents?: () => void;
   runOutputTokens?: number | null;
   questionPrompts?: ReadonlyMap<string, QuestionPrompt>;
 };
-
-export function renderSolidStreamGroupParts(
-  parts: StreamGroupPart[],
-  opts: StreamGroupOptions,
-  presentation: "standalone" | "continuation",
-) {
-  return <StreamGroupParts parts={parts} options={opts} presentation={presentation} />;
-}
 
 export function StreamGroupParts(props: {
   parts: StreamGroupPart[];
@@ -109,19 +66,22 @@ export function StreamGroupParts(props: {
   return (
     <For each={props.parts} keyed={(part) => `${part.kind}:${part.key}`}>
       {(part) => (
-        <StreamPartView part={part()} options={props.options} presentation={props.presentation} />
+        <StreamPartView
+          part={part()}
+          options={{
+            ...props.options,
+            firstBubbleKey:
+              props.options.firstBubbleKey !== undefined
+                ? props.options.firstBubbleKey
+                : (props.parts.find(
+                    (candidate) => candidate.kind === "stream" && candidate.text.trim(),
+                  )?.key ?? null),
+          }}
+          presentation={props.presentation}
+        />
       )}
     </For>
   );
-}
-
-/** A wait no loaded handoff can place: the standard working row, after the transcript. */
-export function renderSolidUnplacedSubagentWait(
-  sessionKey: string,
-  wait: ChatSubagentWait,
-  opts: StreamGroupOptions,
-) {
-  return <UnplacedSubagentWait sessionKey={sessionKey} wait={wait} options={opts} />;
 }
 
 export function UnplacedSubagentWait(props: {
@@ -133,19 +93,11 @@ export function UnplacedSubagentWait(props: {
     {
       kind: "reading-indicator",
       key: `waiting-subagents:${props.sessionKey}`,
-      startedAt: props.wait.startedAt ?? 0,
+      startedAt: props.wait.startedAt,
       waitingOn: "subagents",
     },
   ]);
   return <StreamGroup parts={parts()} options={props.options} />;
-}
-
-export function renderSolidStreamGroupPart(
-  part: StreamGroupPart,
-  opts: StreamGroupOptions,
-  presentation: "standalone" | "continuation",
-) {
-  return <StreamPartView part={part} options={opts} presentation={presentation} />;
 }
 
 export function StreamPartView(props: {
@@ -155,16 +107,7 @@ export function StreamPartView(props: {
 }) {
   const stream = () => (props.part.kind === "stream" ? props.part : undefined);
   return (
-    <Show
-      when={stream()}
-      fallback={
-        <NonstreamPart
-          part={props.part}
-          options={props.options}
-          presentation={props.presentation}
-        />
-      }
-    >
+    <Show when={stream()} fallback={<NonstreamPart {...props} />}>
       <StreamingMessage part={stream} options={props.options} />
     </Show>
   );
@@ -175,32 +118,41 @@ function NonstreamPart(props: {
   options: StreamGroupOptions;
   presentation: "standalone" | "continuation";
 }) {
-  const content = createMemo(() => {
-    if (props.part.kind === "reading-indicator") {
-      return renderChatWorkingIndicator(props.part, {
-        bubbleMode: props.options.bubbleMode,
-        mascot: props.options.branding?.mascot,
-        workingIndicator: props.options.branding?.workingIndicator,
-        workingPhrases: props.options.branding?.workingPhrases,
-        waitingApproval: props.options.waitingApproval === true,
-        waitingSubagents:
-          props.part.waitingOn === "subagents" ? props.options.waitingSubagents : undefined,
-        runningSubagents: props.options.runningSubagents,
-        subagentActivity: props.options.subagentActivity,
-        onOpenSubagent: props.options.onOpenSubagent,
-        onOpenSubagents: props.options.onOpenSubagents,
-        startupLabel: props.options.startupLabel,
-        outputTokens: props.options.runOutputTokens,
-        presentation: props.presentation,
-      });
-    }
-    const prompt =
-      props.part.kind === "question"
-        ? props.options.questionPrompts?.get(props.part.questionId)
-        : undefined;
-    return prompt ? renderChatQuestionSummary(prompt) : litNothing;
-  });
-  return <LitContent value={content()} />;
+  const indicator = () => (props.part.kind === "reading-indicator" ? props.part : undefined);
+  const question = () =>
+    props.part.kind === "question"
+      ? props.options.questionPrompts?.get(props.part.questionId)
+      : undefined;
+  return (
+    <Show
+      when={indicator()}
+      fallback={
+        <Show when={question()}>{(prompt) => <ChatQuestionSummary prompt={prompt()} />}</Show>
+      }
+    >
+      {(part) => (
+        <ChatWorkingIndicator
+          part={part()}
+          options={{
+            bubbleMode: props.options.bubbleMode,
+            mascot: props.options.branding?.mascot,
+            workingIndicator: props.options.branding?.workingIndicator,
+            workingPhrases: props.options.branding?.workingPhrases,
+            waitingApproval: props.options.waitingApproval === true,
+            waitingSubagents:
+              part().waitingOn === "subagents" ? props.options.waitingSubagents : undefined,
+            runningSubagents: props.options.runningSubagents,
+            subagentActivity: props.options.subagentActivity,
+            onOpenSubagents: props.options.onOpenSubagents,
+            startupLabel: props.options.startupLabel,
+            retryAt: props.options.retryAt,
+            outputTokens: props.options.runOutputTokens,
+            presentation: props.presentation,
+          }}
+        />
+      )}
+    </Show>
+  );
 }
 
 function StreamingMessage(props: {
@@ -232,7 +184,6 @@ function StreamingMessage(props: {
       options={{
         ...props.options,
         isStreaming: part().isStreaming,
-        entryRef: props.options.entryRefFor?.(part().key),
         showReasoning: Boolean(part().thinking),
         messageActions: actions(),
       }}
@@ -244,11 +195,8 @@ function StreamingMessage(props: {
 // One assistant group per contiguous run of streaming items: a reply that
 // arrives as several stream segments renders under a single avatar/footer
 // instead of flashing a separate avatar+bubble per segment (#63956).
-export function renderSolidStreamGroup(parts: StreamGroupPart[], opts: StreamGroupOptions = {}) {
-  return <StreamGroup parts={parts} options={opts} />;
-}
-
 export function StreamGroup(props: { parts: StreamGroupPart[]; options: StreamGroupOptions }) {
+  const replyElements: ReplyConnectorElements = {};
   const starts = () =>
     props.parts.flatMap((part) => (part.kind === "stream" ? [part.startedAt] : []));
   const startedAt = () => (starts().length ? Math.min(...starts()) : null);
@@ -257,10 +205,7 @@ export function StreamGroup(props: { parts: StreamGroupPart[]; options: StreamGr
       (part) => part.kind === "reading-indicator" || (part.kind === "stream" && part.isStreaming),
     );
   const source = () => props.parts.find((part) => part.kind === "stream");
-  const avatar = () =>
-    source() && props.options.showAssistantAvatar !== false
-      ? renderChatAvatar("assistant", props.options.assistant)
-      : litNothing;
+  const hasAvatar = () => Boolean(source() && props.options.showAssistantAvatar !== false);
   const replyLine = () =>
     resolveGroupReplyLine(
       {
@@ -271,9 +216,10 @@ export function StreamGroup(props: { parts: StreamGroupPart[]; options: StreamGr
       },
       props.options.resolveReplyPreview,
     );
-  const hasReply = () => replyLine().state !== "hidden" && avatar() !== litNothing;
+  const hasReply = () => replyLine().state !== "hidden" && hasAvatar();
   return (
     <div
+      ref={(element) => (replyElements.group = element)}
       class={[
         "chat-group assistant",
         {
@@ -283,13 +229,22 @@ export function StreamGroup(props: { parts: StreamGroupPart[]; options: StreamGr
         },
       ]}
       data-chat-row-key={props.parts[0]?.key}
+      data-chat-streaming={active() ? "true" : undefined}
     >
-      <LitContent value={avatar()} />
-      <div class="chat-group-messages">
-        <LitContent value={renderReplyLine(replyLine(), props.options)} />
+      <Show when={hasAvatar()}>
+        <ChatAvatar
+          role="assistant"
+          assistant={props.options.assistant}
+          elementRef={(element) => (replyElements.avatar = element)}
+        />
+      </Show>
+      <div ref={(element) => (replyElements.messages = element)} class="chat-group-messages">
+        <ReplyLineView line={replyLine()} actions={props.options} elements={replyElements} />
         <StreamGroupParts parts={props.parts} options={props.options} presentation="standalone" />
       </div>
-      <LitContent value={renderReplyLineConnector(replyLine(), avatar())} />
+      <Show when={hasAvatar()}>
+        <ReplyLineConnector line={replyLine()} avatar={true} elements={replyElements} />
+      </Show>
       <Show when={startedAt() !== null}>
         <div class="chat-group-footer" aria-hidden={active() ? "true" : undefined}>
           <Show when={!active()}>
@@ -318,7 +273,7 @@ type WorkGroupSummaryOptions = {
   expanded: boolean;
   onToggle: () => void;
   presentation?: "standalone" | "continuation";
-  browserTabPreviews?: unknown;
+  browserTabPreviews?: readonly BrowserTabPreview[];
   bubbleMode?: boolean;
 };
 
@@ -370,14 +325,17 @@ function prepareWorkGroupSummary(item: WorkGroupSummaryItem) {
   const summary = describeToolGroup(activity);
   const total = summary.total;
   const outcomes = summary.outcomes.filter(({ kind }) => kind !== "failed" && kind !== "skipped");
-  return { label, total, outcomes, toolOutcomes: renderToolOutcomeSummary(cards, true, activity) };
+  const toolOutcomes = summarizeToolCardOutcomes(cards, activity);
+  return { label, total, outcomes, cards, activity, toolOutcomes };
 }
 
 function WorkGroupSummaryBody(props: {
   summary: ReturnType<typeof prepareWorkGroupSummary>;
   options: WorkGroupSummaryOptions;
 }) {
-  const compact = () => props.options.bubbleMode && !props.options.expanded;
+  let disclosureContent: HTMLSpanElement | undefined;
+  const syncOverflow = (event: Event) => syncToolDisclosureOverflow(event, disclosureContent);
+  const compact = () => props.options.bubbleMode;
   return (
     <div
       class={[
@@ -392,65 +350,55 @@ function WorkGroupSummaryBody(props: {
         class="chat-inline-disclosure chat-activity-group__summary"
         type="button"
         aria-expanded={props.options.expanded ? "true" : "false"}
-        aria-label={compact() ? t("chat.view.activityDetails") : undefined}
-        onPointerEnter={syncToolDisclosureOverflow}
-        onFocus={syncToolDisclosureOverflow}
+        onPointerEnter={syncOverflow}
+        onFocus={syncOverflow}
         onClick={() => props.options.onToggle()}
       >
-        <Show
-          when={compact()}
-          fallback={
-            <>
-              <span class="chat-tool-disclosure__content">
-                <span class="chat-activity-group__label">{props.summary.label}</span>
-              </span>
-              <Show when={props.options.expanded && props.summary.total > 0}>
-                <span class="chat-work-group__total">
-                  {" · "}
-                  {t(`chat.workRun.toolCalls${props.summary.total === 1 ? "One" : "Many"}`, {
-                    count: String(props.summary.total),
-                  })}
-                </span>
-              </Show>
-              <For each={props.summary.outcomes} keyed={(outcome) => outcome.kind}>
-                {(outcome) => (
-                  <span class="chat-activity-group__outcome muted">
-                    {" · "}
-                    {outcome().label}
-                  </span>
-                )}
-              </For>
-              <Show when={props.summary.toolOutcomes !== litNothing}>
-                <span class="chat-work-group__outcomes">
-                  {" · "}
-                  <LitContent value={props.summary.toolOutcomes} />
-                </span>
-              </Show>
-              <span class="chat-tool-row__chevron" aria-hidden="true">
-                <Icon name="chevronRight" />
-              </span>
-            </>
-          }
+        <span
+          ref={(element) => (disclosureContent = element)}
+          class="chat-tool-disclosure__content"
         >
-          <ChatBubbleDots />
+          <span class="chat-activity-group__label">{props.summary.label}</span>
+        </span>
+        <Show when={props.options.expanded && props.summary.total > 0}>
+          <span class="chat-work-group__total">
+            {" · "}
+            {t(`chat.workRun.toolCalls${props.summary.total === 1 ? "One" : "Many"}`, {
+              count: String(props.summary.total),
+            })}
+          </span>
         </Show>
+        <For each={props.summary.outcomes} keyed={(outcome) => outcome.kind}>
+          {(outcome) => (
+            <span class="chat-activity-group__outcome muted">
+              {" · "}
+              {outcome().label}
+            </span>
+          )}
+        </For>
+        <Show
+          when={props.summary.toolOutcomes.failed > 0 || props.summary.toolOutcomes.skipped > 0}
+        >
+          <span class="chat-work-group__outcomes">
+            {" · "}
+            <openclaw-chat-tool-outcome-summary style={{ display: "contents" }}>
+              <ToolOutcomeSummary cards={props.summary.cards} activity={props.summary.activity} />
+            </openclaw-chat-tool-outcome-summary>
+          </span>
+        </Show>
+        <span class="chat-tool-row__chevron" aria-hidden="true">
+          <Icon name="chevronRight" />
+        </span>
       </button>
       <div class="chat-work-group__separator" aria-hidden="true" />
       <Show when={!props.options.expanded && !props.options.bubbleMode}>
-        <LitContent value={props.options.browserTabPreviews} />
+        <BrowserTabPreviews previews={props.options.browserTabPreviews} />
       </Show>
     </div>
   );
 }
 
 /** Completed work keeps elapsed time and outcomes above the expandable narration. */
-export function renderSolidWorkGroupSummary(
-  item: WorkGroupSummaryItem,
-  options: WorkGroupSummaryOptions,
-) {
-  return <WorkGroupSummary item={item} options={options} />;
-}
-
 export function WorkGroupSummary(props: {
   item: WorkGroupSummaryItem;
   options: WorkGroupSummaryOptions;

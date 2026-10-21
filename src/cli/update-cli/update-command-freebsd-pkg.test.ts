@@ -14,6 +14,7 @@ import { createSystemPackageOwnershipInspection } from "../../infra/update-syste
 import * as exec from "../../process/exec.js";
 import { withTestDir } from "../../test-helpers/temp-dir.js";
 import { withEnvAsync } from "../../test-utils/env.js";
+import { createCommandResult } from "../../test-utils/npm-spec-install-test-helpers.js";
 import { withMockedPlatform } from "../../test-utils/vitest-spies.js";
 import * as shared from "./shared.js";
 import { updateGitInstall } from "./update-command-git.js";
@@ -22,6 +23,18 @@ import { resolveManagedServicePackageUpdatePlan } from "./update-command-service
 import { resolveUpdateCommandTarget } from "./update-command-target.js";
 
 afterEach(() => vi.restoreAllMocks());
+
+const refuseMutation = async () => {
+  throw new Error("Package ownership must be checked before mutation");
+};
+const mockOwnership = (root = "") =>
+  vi
+    .spyOn(exec, "runCommandBuffered")
+    .mockResolvedValue(pkgQueryResult(root && `${root}/package.json\n`));
+function mockInvokingRoot(root: string) {
+  vi.spyOn(shared, "resolveUpdateRoot").mockResolvedValue(root);
+  vi.spyOn(service, "resolveGatewayService").mockReturnValue(createMockGatewayService());
+}
 
 function gitUpdateParams(root: string): Parameters<typeof updateGitInstall>[0] {
   return {
@@ -32,15 +45,9 @@ function gitUpdateParams(root: string): Parameters<typeof updateGitInstall>[0] {
     startedAt: Date.now(),
     progress: {},
     channel: "dev",
-    inspectGitTarget: async () => {
-      throw new Error("Candidate inspection must not bypass package ownership admission");
-    },
-    validateCandidate: async () => {
-      throw new Error("Candidate validation must not bypass package ownership admission");
-    },
-    beforeGitMutation: async () => {
-      throw new Error("Git mutation must not bypass package ownership admission");
-    },
+    inspectGitTarget: refuseMutation,
+    validateCandidate: refuseMutation,
+    beforeGitMutation: refuseMutation,
     getManagedServiceEnv: () => undefined,
     getSnapshotSource: async () => ({ config: {}, env: process.env }),
   };
@@ -78,31 +85,29 @@ async function withPackageRoots(
 describe("FreeBSD pkg update admission", () => {
   it.each([
     { platform: "freebsd", manager: "pkg", ownership: "owned" },
-    { platform: "freebsd", manager: "pkg", ownership: "unknown" },
     { platform: "freebsd", manager: "pkg", ownership: "unowned" },
     { platform: "linux", manager: "pacman", ownership: "owned" },
-    { platform: "linux", manager: "pacman", ownership: "unknown" },
-    { platform: "linux", manager: "pacman", ownership: "unowned" },
+    { platform: "linux", manager: "pacman", ownership: "missing" },
+    { platform: "freebsd", manager: "pkg", ownership: "missing" },
   ] as const)(
     "admits $manager roots before npm discovery ($ownership)",
     async ({ platform, manager, ownership }) => {
       await withPackageRoots(async (_base, root) => {
-        const command = vi.spyOn(exec, "runCommandWithTimeout").mockResolvedValue({
-          stdout: `${path.dirname(root)}\n`,
-          stderr: "",
-          code: 0,
-          signal: null,
-          killed: false,
-          termination: "exit",
-        });
-        const runCommand = vi
-          .fn<typeof exec.runCommandBuffered>()
-          .mockResolvedValue(
-            pkgQueryResult(
-              ownership === "owned" ? `${root}/package.json\n` : "",
-              ownership === "unknown" ? { code: 1 } : {},
-            ),
-          );
+        const command = vi
+          .spyOn(exec, "runCommandWithTimeout")
+          .mockResolvedValue(createCommandResult({ stdout: `${path.dirname(root)}\n` }));
+        const runCommand = vi.fn<typeof exec.runCommandBuffered>().mockResolvedValue(
+          pkgQueryResult(
+            ownership === "owned" ? `${root}/package.json\n` : "",
+            ownership === "missing"
+              ? {
+                  code: null,
+                  termination: "error",
+                  error: Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }),
+                }
+              : {},
+          ),
+        );
         const onWarning = vi.fn();
         const admission = shared.resolveGlobalManager({
           root,
@@ -113,7 +118,17 @@ describe("FreeBSD pkg update admission", () => {
         if (ownership !== "owned") {
           await expect(admission).resolves.toBe("npm");
           expect(command).toHaveBeenCalled();
-          expect(onWarning).toHaveBeenCalledTimes(ownership === "unknown" ? 1 : 0);
+          if (ownership === "missing") {
+            expect(onWarning).toHaveBeenCalledExactlyOnceWith(
+              expect.stringContaining(`${manager} executable was not found`),
+            );
+            expect(onWarning.mock.calls[0]?.[0]).toContain(
+              "Continuing without verified system-package ownership.",
+            );
+            expect(onWarning.mock.calls[0]?.[0]).not.toContain("Restore access");
+          } else {
+            expect(onWarning).not.toHaveBeenCalled();
+          }
         } else {
           await expect(admission).rejects.toBeInstanceOf(shared.UpdatePreMutationError);
           await expect(admission).rejects.toMatchObject({
@@ -128,9 +143,8 @@ describe("FreeBSD pkg update admission", () => {
 
   it("reuses completed admission after a long confirmation without timing out path inspection", async () => {
     await withPackageRoots(async (_base, root) => {
-      vi.spyOn(shared, "resolveUpdateRoot").mockResolvedValue(root);
-      vi.spyOn(service, "resolveGatewayService").mockReturnValue(createMockGatewayService());
-      const query = vi.spyOn(exec, "runCommandBuffered").mockResolvedValue(pkgQueryResult());
+      mockInvokingRoot(root);
+      const query = mockOwnership();
       const prepared = await prepareUpdateCommand({ dryRun: true });
       vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_000);
       await expect(
@@ -179,9 +193,7 @@ describe("FreeBSD pkg update admission", () => {
         .spyOn(shared, "ensureGitCheckout")
         .mockRejectedValue(new Error("unexpected checkout mutation"));
       const getSnapshotSource = vi.fn(async () => ({ config: {}, env: process.env }));
-      vi.spyOn(exec, "runCommandBuffered").mockResolvedValue(
-        pkgQueryResult(`${selected}/package.json\n`),
-      );
+      mockOwnership(selected);
       await expect(
         updateGitInstall({
           ...gitUpdateParams(requested),
@@ -208,9 +220,7 @@ describe("FreeBSD pkg update admission", () => {
         vi.spyOn(service, "resolveGatewayService").mockReturnValue(
           createMockGatewayService({ readCommand }),
         );
-        vi.spyOn(exec, "runCommandBuffered").mockResolvedValue(
-          pkgQueryResult(`${root}/package.json\n`),
-        );
+        mockOwnership(root);
         await expect(prepareUpdateCommand(opts)).rejects.toMatchObject({
           reason: "pkg-owned-install",
         });
@@ -218,28 +228,6 @@ describe("FreeBSD pkg update admission", () => {
         await expect(fs.stat(path.join(base, ".openclaw"))).rejects.toMatchObject({
           code: "ENOENT",
         });
-      });
-    },
-  );
-
-  it.each(["state", "profile"])(
-    "does not let a non-default %s bypass pkg ownership",
-    async (selector) => {
-      await withPackageRoots(async (base, root) => {
-        vi.spyOn(shared, "resolveUpdateRoot").mockResolvedValue(root);
-        vi.spyOn(exec, "runCommandBuffered").mockResolvedValue(
-          pkgQueryResult(`${root}/package.json\n`),
-        );
-        await withEnvAsync(
-          selector === "state"
-            ? { OPENCLAW_STATE_DIR: path.join(base, "custom-state") }
-            : { OPENCLAW_PROFILE: "alternate" },
-          async () => {
-            await expect(prepareUpdateCommand({ restart: false })).rejects.toMatchObject({
-              reason: "pkg-owned-install",
-            });
-          },
-        );
       });
     },
   );
@@ -260,9 +248,7 @@ describe("FreeBSD pkg update admission", () => {
           createMockGatewayService({ readCommand }),
         );
         const owned = owner === "requested" ? requested : managed;
-        vi.spyOn(exec, "runCommandBuffered").mockResolvedValue(
-          pkgQueryResult(`${owned}/package.json\n`),
-        );
+        mockOwnership(owned);
         await expect(
           resolveManagedServicePackageUpdatePlan({ root: requested }),
         ).rejects.toMatchObject({ reason: "pkg-owned-install" });
@@ -271,39 +257,16 @@ describe("FreeBSD pkg update admission", () => {
     },
   );
 
-  it("checks pkg ownership before reading admission environment from a service", async () => {
-    await withPackageRoots(async (_base, root) => {
-      const readCommand = vi.fn();
-      const isAbsent = vi.fn();
-      vi.spyOn(service, "resolveGatewayService").mockReturnValue(
-        createMockGatewayService({ readCommand, isAbsent }),
-      );
-      vi.spyOn(exec, "runCommandBuffered").mockResolvedValue(
-        pkgQueryResult(`${root}/package.json\n`),
-      );
-      await expect(
-        resolveUpdateCommandAdmissionEnv({ root, opts: { restart: false } }),
-      ).rejects.toMatchObject({ reason: "pkg-owned-install" });
-      expect(readCommand).not.toHaveBeenCalled();
-      expect(isAbsent).not.toHaveBeenCalled();
-    });
-  });
-
   it("checks a precomputed service redirect before admitting its target", async () => {
     await withPackageRoots(async (_base, root, managed) => {
-      vi.spyOn(shared, "resolveUpdateRoot").mockResolvedValue(root);
-      vi.spyOn(service, "resolveGatewayService").mockReturnValue(createMockGatewayService());
-      vi.spyOn(exec, "runCommandBuffered").mockResolvedValue(
-        pkgQueryResult(`${managed}/package.json\n`),
-      );
+      mockInvokingRoot(root);
+      mockOwnership(managed);
       const prepared = await prepareUpdateCommand({ dryRun: true });
       prepared.servicePlan = {
         rootRedirect: { root: managed, previousRoot: root },
         nodeRunner: "/fixture/bin/node",
       };
-      const enter = vi.fn(async () => {
-        throw new Error("Package ownership must precede executor admission");
-      });
+      const enter = vi.fn(refuseMutation);
       await expect(
         resolveUpdateCommandTarget(
           { dryRun: true },

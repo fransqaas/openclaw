@@ -185,8 +185,6 @@ export type AuthProfileCredentialSource = {
 export type RuntimeAuthProfileStore = AuthProfileStore & {
   /** Physical sources of the selected rows; retained only in session read views. */
   runtimeCredentialSources?: Record<string, AuthProfileCredentialSource>;
-  /** Runtime-only built-in CLI winners; internal provenance, never exposed or persisted. */
-  runtimeExternalCliProfileIds?: string[];
   runtimeLocalProfileIds?: string[];
   /** Canonical local OAuth rows may be hidden by shared-store reconciliation. */
   runtimeHasLocalOAuthProfiles?: boolean;
@@ -199,6 +197,4 @@ export type AuthProfileIdRepairResult = {
   config: OpenClawConfig;
   changes: string[];
   migrated: boolean;
-  fromProfileId?: string;
-  toProfileId?: string;
 };

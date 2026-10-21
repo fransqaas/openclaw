@@ -17,7 +17,11 @@ import {
   inspectQaExecutionIdentityStorage,
   readNativeQaSubagentRuns,
 } from "./execution-identity-storage-inspection.js";
-import { assertNoGatewayLogSentinels, scanGatewayLogSentinels } from "./gateway-log-sentinel.js";
+import {
+  assertNoGatewayLogSentinels,
+  formatGatewayLogSentinelSummary,
+  scanGatewayLogSentinels,
+} from "./gateway-log-sentinel.js";
 import { resolveQaLiveTurnTimeoutMs } from "./live-timeout.js";
 import { splitQaModelRef } from "./model-selection.js";
 import * as modelSwitchEval from "./model-switch-eval.js";
@@ -58,9 +62,29 @@ const qaSuiteScenarioIdentityDeps = {
   sleep,
   randomUUID,
   projectQaToolMessages,
-  ...suiteRuntimeAgentMedia,
-  ...suiteRuntimeAgentProcess,
-  ...suiteRuntimeAgentSession,
+  // YAML scenarios resolve these bindings by name; keep the registry statically visible.
+  ensureImageGenerationConfigured: suiteRuntimeAgentMedia.ensureImageGenerationConfigured,
+  extractMediaPathFromText: suiteRuntimeAgentMedia.extractMediaPathFromText,
+  resolveGeneratedImagePath: suiteRuntimeAgentMedia.resolveGeneratedImagePath,
+  findManagedDreamingCronJob: suiteRuntimeAgentProcess.findManagedDreamingCronJob,
+  forceMemoryIndex: suiteRuntimeAgentProcess.forceMemoryIndex,
+  listCronJobs: suiteRuntimeAgentProcess.listCronJobs,
+  readDoctorMemoryStatus: suiteRuntimeAgentProcess.readDoctorMemoryStatus,
+  runAgentPrompt: suiteRuntimeAgentProcess.runAgentPrompt,
+  startAgentRun: suiteRuntimeAgentProcess.startAgentRun,
+  waitForAgentHistory: suiteRuntimeAgentProcess.waitForAgentHistory,
+  waitForAgentHistoryReply: suiteRuntimeAgentProcess.waitForAgentHistoryReply,
+  waitForAgentRun: suiteRuntimeAgentProcess.waitForAgentRun,
+  createSession: suiteRuntimeAgentSession.createSession,
+  readEffectiveTools: suiteRuntimeAgentSession.readEffectiveTools,
+  readQaSessionTranscriptEvents: suiteRuntimeAgentSession.readQaSessionTranscriptEvents,
+  readRawQaSessionStore: suiteRuntimeAgentSession.readRawQaSessionStore,
+  readSessionToolActivity: suiteRuntimeAgentSession.readSessionToolActivity,
+  readSessionTranscriptSummary: suiteRuntimeAgentSession.readSessionTranscriptSummary,
+  readSkillStatus: suiteRuntimeAgentSession.readSkillStatus,
+  readSubagentHandoffReply: suiteRuntimeAgentSession.readSubagentHandoffReply,
+  seedQaSessionEntries: suiteRuntimeAgentSession.seedQaSessionEntries,
+  seedQaSessionTranscript: suiteRuntimeAgentSession.seedQaSessionTranscript,
   callPluginToolsMcp,
   findSkill,
   handleQaAction,
@@ -84,6 +108,44 @@ const qaSuiteScenarioIdentityDeps = {
   formatToolSearchDiscoveryReceipt,
   requireToolSearchDiscoveryEvidence,
 };
+
+const QA_FAILURE_GATEWAY_SENTINEL_LIMIT = 5;
+
+const isValidGatewayLogMark = (mark: number | undefined): mark is number =>
+  Number.isSafeInteger(mark) && (mark ?? -1) >= 0;
+
+// Gateway log sentinels often name the cause of a wait timeout (for example a
+// channel final reply that failed to deliver) while transport timeouts stay
+// content-free. Attach them to the failed step only: parity classifies
+// scenario-level details by keyword, and appended log text must not move it.
+function appendGatewayLogSentinelEvidence(
+  result: QaSuiteScenarioResult,
+  gateway: QaSuiteScenarioFlowEnv["gateway"],
+  mark: number | undefined,
+): QaSuiteScenarioResult {
+  const failedStepIndex = result.steps.findIndex((step) => step.status === "fail");
+  if (failedStepIndex < 0 || !gateway.readLogsSince || !isValidGatewayLogMark(mark)) {
+    return result;
+  }
+  const findings = scanGatewayLogSentinels(gateway.readLogsSince(mark));
+  if (findings.length === 0) {
+    return result;
+  }
+  const omitted = findings.length - QA_FAILURE_GATEWAY_SENTINEL_LIMIT;
+  const evidence = [
+    "Gateway log sentinel(s) during scenario:",
+    formatGatewayLogSentinelSummary(findings.slice(0, QA_FAILURE_GATEWAY_SENTINEL_LIMIT)),
+    ...(omitted > 0 ? [`(${omitted} more)`] : []),
+  ].join("\n");
+  return {
+    ...result,
+    steps: result.steps.map((step, index) =>
+      index === failedStepIndex
+        ? { ...step, details: step.details ? `${step.details}\n${evidence}` : evidence }
+        : step,
+    ),
+  };
+}
 
 export async function runQaSuiteScenarioSteps(
   name: string,
@@ -148,13 +210,10 @@ function createQaSuiteScenarioDeps(
     });
   const markLogs = params.env.gateway.markLogs;
   const readLogsSince = params.env.gateway.readLogsSince;
-  let monotonicGatewayLogs =
+  const monotonicGatewayLogs =
     typeof markLogs === "function" && typeof readLogsSince === "function"
       ? { mark: markLogs, readSince: readLogsSince }
       : undefined;
-  const isValidGatewayLogMark = (mark: number | undefined): mark is number =>
-    Number.isSafeInteger(mark) && (mark ?? -1) >= 0;
-  const fullLegacyGatewayLogSnapshotMark = -1;
   const readGatewayLogs = (mark?: number) => {
     if (monotonicGatewayLogs && isValidGatewayLogMark(mark)) {
       return monotonicGatewayLogs.readSince(mark);
@@ -176,32 +235,12 @@ function createQaSuiteScenarioDeps(
     webSnapshot: webRuntime.qaWebSnapshot,
     webEvaluate: webRuntime.qaWebEvaluate,
     readGatewayLogs,
-    markGatewayLogCursor: () => {
-      if (monotonicGatewayLogs) {
-        const mark = monotonicGatewayLogs.mark();
-        if (isValidGatewayLogMark(mark)) {
-          return mark;
-        }
-        monotonicGatewayLogs = undefined;
-        return fullLegacyGatewayLogSnapshotMark;
-      }
-      return fullLegacyGatewayLogSnapshotMark;
-    },
+    markGatewayLogCursor: () => monotonicGatewayLogs?.mark() ?? -1,
     scanGatewayLogSentinels: (options?: Parameters<typeof scanGatewayLogSentinels>[1]) =>
       scanGatewayLogSentinels(readGatewayLogs(options?.since), { ...options, since: 0 }),
     assertNoGatewayLogSentinels: (options?: Parameters<typeof assertNoGatewayLogSentinels>[1]) =>
       assertNoGatewayLogSentinels(readGatewayLogs(options?.since), { ...options, since: 0 }),
-    runRuntimeToolFixture: async (
-      envArg: QaSuiteScenarioFlowEnv,
-      configArg: Record<string, unknown>,
-    ) =>
-      runtimeToolFixture.runRuntimeToolFixture(envArg, configArg, {
-        createSession: suiteRuntimeAgentSession.createSession,
-        readEffectiveTools: suiteRuntimeAgentSession.readEffectiveTools,
-        runAgentPrompt: suiteRuntimeAgentProcess.runAgentPrompt,
-        fetchJson: suiteRuntimeGateway.fetchJson,
-        ensureImageGenerationConfigured: suiteRuntimeAgentMedia.ensureImageGenerationConfigured,
-      }),
+    runRuntimeToolFixture: runtimeToolFixture.runRuntimeToolFixture,
     formatErrorMessage: formatQaErrorMessage,
     liveTurnTimeoutMs: resolveQaLiveTurnTimeoutMs,
     resolveQaLiveTurnTimeoutMs,
@@ -293,6 +332,7 @@ function createQaSuiteScenarioStepRunner(
   const prepareFlow = env.transport.prepareFlow;
   const execution = scenario.execution;
   return async (name, steps) => {
+    const gatewayLogMark = env.gateway.markLogs?.();
     const scenarioSteps = steps.map((step) =>
       Object.assign({}, step, { run: async () => await deadline.run(step.run) }),
     );
@@ -338,7 +378,10 @@ function createQaSuiteScenarioStepRunner(
             ...scenarioSteps,
           ]
         : scenarioSteps;
-    return await runScenario(name, preparedSteps);
+    const result = await runScenario(name, preparedSteps);
+    return result.status === "fail"
+      ? appendGatewayLogSentinelEvidence(result, env.gateway, gatewayLogMark)
+      : result;
   };
 }
 
