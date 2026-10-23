@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 import {
   hasRecallIntent,
   resolveRecallEscalationDecision,
@@ -315,20 +315,25 @@ describe("active-memory escalation", () => {
     ["ignores abort", async () => await new Promise<"skip">(() => {}), "timeout"],
   ] as const)(
     "falls back to the built-in matcher when the decider %s",
-    async (_label, decide, expectedReason) => {
+    async (_label, decideRecall, expectedReason) => {
+      // Drive the decider deadline with a fake clock instead of waiting on real timers.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+      onTestFinished(() => {
+        vi.useRealTimers();
+      });
       const fallbacks: string[] = [];
-      await expect(
-        resolveRecallEscalationDecisionWithDecider({
-          mode: "escalate",
-          message: "What did we decide last time?",
-          searchQuery: "What did we decide last time?",
-          hasStrongLaneOneHit: false,
-          decider: { decide },
-          signal: new AbortController().signal,
-          timeoutMs: 5,
-          onDeciderFallback: (reason) => fallbacks.push(reason),
-        }),
-      ).resolves.toBe("recall");
+      const pending = resolveRecallEscalationDecisionWithDecider({
+        mode: "escalate",
+        message: "What did we decide last time?",
+        searchQuery: "What did we decide last time?",
+        hasStrongLaneOneHit: false,
+        decider: { decide: decideRecall },
+        signal: new AbortController().signal,
+        timeoutMs: 5,
+        onDeciderFallback: (reason) => fallbacks.push(reason),
+      });
+      await vi.advanceTimersByTimeAsync(5);
+      await expect(pending).resolves.toBe("recall");
       expect(fallbacks).toEqual([expectedReason]);
     },
   );
