@@ -51,6 +51,8 @@ export async function resolveDiscordPreflightRoute(params: {
     runtimeConversationId: bindingConversationId,
     configuredConversationId: params.messageChannelId,
     parentConversationId: params.earlyThreadParentId,
+    // Processing owns the awaited activity write after preflight completes.
+    touchBinding: false,
   });
   const configuredBinding = configuredRoute?.bindingResolution ?? null;
   const threadBinding = runtimeRoute.bindingRecord ?? configuredBinding?.record;
@@ -72,7 +74,6 @@ export async function resolveDiscordPreflightRoute(params: {
     configuredBinding,
     boundSessionKey,
     effectiveRoute,
-    boundAgentId: boundSessionKey ? effectiveRoute.agentId : undefined,
     baseSessionKey: effectiveRoute.sessionKey,
   };
 }

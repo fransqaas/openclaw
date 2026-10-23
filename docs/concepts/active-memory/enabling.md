@@ -105,7 +105,7 @@ To inspect it live in a conversation:
 What the key fields do:
 
 - `plugins.entries.active-memory.enabled: true` turns the plugin on
-- `config.mode: "escalate"` runs deep recall only for recall intent without a strong deterministic hit
+- `config.mode: "escalate"` runs deep recall only for recall intent without a strong rule-based recall hit
 - `config.escalationDecision: true` (optional) asks the agent's [Decision model](/concepts/decision-models) for that intent decision
 - `config.agents: ["main"]` opts only the `main` agent in
 - `config.allowedChatTypes: ["direct"]` scopes it to direct-message sessions (opt in groups/channels explicitly)
@@ -142,7 +142,7 @@ instead of relying only on the built-in intent matcher:
 ```
 
 Active Memory asks one Boolean question (`deepRecall`) for purpose
-`active-memory/escalation`, only after deterministic recall has not produced a
+`active-memory/escalation`, only after rule-based recall has not produced a
 strong hit. A `probabilityTrue` of at least 0.5 runs deep recall; a lower value
 skips it. The request carries only the bounded latest user message and search
 query, and it must answer within the remaining preflight budget (at most one

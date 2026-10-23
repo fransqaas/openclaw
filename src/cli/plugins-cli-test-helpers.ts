@@ -1,7 +1,7 @@
 // Shared Vitest mocks and runtime capture helpers for plugin CLI command tests.
 import { Command } from "commander";
 import type { Mock } from "vitest";
-import { vi } from "vitest";
+import { expect, vi } from "vitest";
 import { createTestConfigSnapshot } from "../commands/test-runtime-config-helpers.js";
 import { getRuntimeConfig } from "../config/config.js";
 import type { HookInstallRecord } from "../config/types.hooks.js";
@@ -320,6 +320,7 @@ vi.mock("../config/io.js", async (importOriginal) => {
   };
 });
 
+// mock-isolation: Plugin CLI fixtures control config writes and Nix behavior without host state.
 vi.mock("../config/config.js", () => ({
   assertConfigWriteAllowedInCurrentMode: () => {
     if (process.env.OPENCLAW_NIX_MODE === "1") {
@@ -335,6 +336,7 @@ vi.mock("../config/config.js", () => ({
   },
   getRuntimeConfig: () => pluginCliConfigMock(),
   loadConfig: () => pluginCliConfigMock(),
+  captureRuntimeConfigAsyncReader: () => async () => pluginCliConfigMock(),
   readConfigFileSnapshot: ((
     ...args: Parameters<(typeof import("../config/config.js"))["readConfigFileSnapshot"]>
   ) =>
@@ -908,6 +910,16 @@ export async function runPluginsCommand(argv: string[]) {
   program.exitOverride();
   registerPluginsCli(program);
   return await program.parseAsync(argv, { from: "user" });
+}
+
+export function runPluginCli(...args: string[]) {
+  return runPluginsCommand(["plugins", ...args]);
+}
+
+export function expectNoPluginCliCalls(...mocks: unknown[]) {
+  for (const mock of mocks) {
+    expect(mock).not.toHaveBeenCalled();
+  }
 }
 
 export function resetPluginsCliTestState() {

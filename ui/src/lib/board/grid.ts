@@ -178,11 +178,6 @@ export function nudge(
   return canonical.map(withOrder);
 }
 
-/** CSS grid lines are one-based; engine cells are zero-based. */
-export function toCssPlacement(rect: BoardGridRect): string {
-  return `grid-column: ${rect.x + 1} / span ${rect.w}; grid-row: ${rect.y + 1} / span ${rect.h};`;
-}
-
 // Keep this numeric inset aligned with the app-level --widget-frame-inset token.
 const BOARD_WIDGET_FRAME_INSET = 12;
 // board.css keeps a 1px border even when frameless. Reserve both edges so
@@ -229,10 +224,6 @@ function autoBoardWidgetHeightPx(
   );
 }
 
-function boardRowSpanPx(rows: number): number {
-  return rows * BOARD_GRID_ROW_HEIGHT + (rows - 1) * BOARD_GRID_GAP;
-}
-
 export function effectiveBoardWidgetRows(
   widget: BoardWidgetSizingInput,
   contentHeightPx: number | undefined,
@@ -268,10 +259,8 @@ export function exactBoardWidgetHeightPx(
   }
   // Never exceed the quantized cell. The normal editable board retains its row
   // cap; shell-free documents can raise it so the document owns vertical scroll.
-  return Math.min(
-    requiredHeight,
-    boardRowSpanPx(effectiveBoardWidgetRows(widget, contentHeightPx, chromeRowPx, maxAutoRows)),
-  );
+  const rows = effectiveBoardWidgetRows(widget, contentHeightPx, chromeRowPx, maxAutoRows);
+  return Math.min(requiredHeight, rows * BOARD_GRID_ROW_HEIGHT + (rows - 1) * BOARD_GRID_GAP);
 }
 
 /** Structural sizing inputs so pure grid math stays free of view-type imports. */
@@ -284,7 +273,7 @@ type BoardWidgetSizingInput = {
 
 export function boardWidgetGridItems(
   widgets: readonly (BoardWidgetSizingInput & { name: string; sizeW: number; position: number })[],
-  contentHeights: ReadonlyMap<string, number>,
+  contentHeights: Pick<ReadonlyMap<string, number>, "get">,
   fitAutoContent = false,
   pageWidgetName = "",
 ): BoardGridItem[] {

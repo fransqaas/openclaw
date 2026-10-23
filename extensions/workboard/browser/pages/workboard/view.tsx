@@ -5,18 +5,20 @@ import { icons } from "../../components/icons.tsx";
 import { WorkboardToast } from "../../components/toast.tsx";
 import { t } from "../../i18n/index.ts";
 import { listSelectableAgents } from "../../lib/agents/display.ts";
-import { groupWorkboardCardsByStatus } from "../../lib/workboard/derived.ts";
-import "../../styles/workboard.css";
 import {
-  dispatchWorkboard,
   filterWorkboardCards,
+  groupWorkboardCardsByStatus,
   workboardCardMatchesHealthKey,
-  getWorkboardState,
-  workboardHasActiveWrites,
+} from "../../lib/workboard/derived.ts";
+import { loadWorkboard } from "../../lib/workboard/loading.ts";
+import { dispatchWorkboard } from "../../lib/workboard/mutations.ts";
+import { workboardHasActiveWrites } from "../../lib/workboard/runtime.ts";
+import {
   WORKBOARD_PRIORITIES,
   type WorkboardCard,
   type WorkboardStatus,
-} from "../../lib/workboard/index.ts";
+} from "../../lib/workboard/types.ts";
+import "../../styles/workboard.css";
 import { agentDisplayName, buildAgentFilterOptions } from "./agent-filter.ts";
 import { buildBoardFilterOptions, WORKBOARD_ALL_BOARDS_FILTER } from "./board-filter.ts";
 import { getVisibleDetailCard, CardDetailsPanel } from "./view-card-details.tsx";
@@ -37,6 +39,7 @@ import {
   formatPriorityLabel,
   workboardErrorMessage,
   workboardMutationContext,
+  workboardViewState,
   PriorityIcon,
   dispatchSummaryMessage,
   refreshStatusLabel,
@@ -52,10 +55,7 @@ import type { WorkboardSelectOption } from "./workboard-select.ts";
 const workboardFilterPopoverId = "workboard-filter-popover";
 
 function AgentControl(props: { workboard: WorkboardProps; options: WorkboardSelectOption[] }) {
-  const state = () => {
-    void props.workboard.revision;
-    return getWorkboardState(props.workboard.host);
-  };
+  const state = workboardViewState(() => props.workboard);
   return (
     <>
       {props.workboard.scopeControl ? (
@@ -83,10 +83,7 @@ function WorkboardColumns(props: {
   statuses: WorkboardStatus[];
   byStatus: Map<WorkboardStatus, WorkboardCard[]>;
 }) {
-  const state = () => {
-    void props.workboard.revision;
-    return getWorkboardState(props.workboard.host);
-  };
+  const state = workboardViewState(() => props.workboard);
   const boardEdges = boardScrollEdgesRef();
   return (
     <div
@@ -131,10 +128,7 @@ function WorkboardColumns(props: {
 }
 
 export function WorkboardView(props: WorkboardProps & { onRefresh: () => void }) {
-  const state = () => {
-    void props.revision;
-    return getWorkboardState(props.host);
-  };
+  const state = workboardViewState(() => props);
   const view = createMemo(() => {
     const current = state();
     const agentOptions = buildAgentFilterOptions(props.agentsList, current.cards);
@@ -555,6 +549,21 @@ export function WorkboardView(props: WorkboardProps & { onRefresh: () => void })
             <ActiveFilters filters={view().activeFilters} requestUpdate={props.onRequestUpdate} />
           ) : null}
         </div>
+        {state().nextCursor ? (
+          <div class="workboard-pagination" role="status">
+            <span>{t("workboard.partialCards", { count: String(state().cards.length) })}</span>
+            <button
+              class="btn"
+              type="button"
+              disabled={state().loading}
+              onClick={() => {
+                void loadWorkboard({ ...workboardMutationContext(props), more: true });
+              }}
+            >
+              {t(state().loading ? "common.refreshing" : "workboard.loadMoreCards")}
+            </button>
+          </div>
+        ) : null}
         {(view().filtered.length === 0 && view().activeFiltering) ||
         view().visibleStatuses.length === 0 ? (
           <div class="workboard-empty-state" role="status">

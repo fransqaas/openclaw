@@ -1,8 +1,8 @@
 import type { ToolsCatalogResult } from "../../api/types.ts";
 import { pathForRoute } from "../../app-route-paths.ts";
 import type { ApplicationContext } from "../../app/context.ts";
-import { formatUiError } from "../../lib/format-error.ts";
 import { isGatewayMethodAdvertised } from "../../lib/gateway-methods.ts";
+import type { GatewayPageBinding } from "../../lib/gateway-page-binding.ts";
 import { inspectPlugin } from "../../lib/plugins/capability-consent-error.ts";
 import {
   loadPluginDiscoveryDetail,
@@ -10,20 +10,20 @@ import {
   type PluginDiscoveryDetailResult,
   type PluginListResult,
 } from "../../lib/plugins/index.ts";
-import type { GatewayPageController } from "../../lit/gateway-page-controller.ts";
 import type { PluginsPageCatalogDetail, PluginsPageDetail } from "./plugins-page-model.ts";
 import type { PluginsRouteData } from "./route-data.ts";
-import type { PluginToolPreview } from "./tool-preview.ts";
+import type { PluginToolPreview } from "./tool-preview.tsx";
 
 /** Local inspection owns availability; optional metadata never delays the installed controls. */
 export async function loadInstalledPluginDetail(params: {
   pluginId: string | null;
   plugin: PluginCatalogItem | undefined;
   catalog: PluginDiscoveryDetailResult | null | undefined;
-  gateway: GatewayPageController;
+  gateway: GatewayPageBinding;
   canInspect: boolean;
   getDetail: () => PluginsPageDetail | null;
   onChange: (detail: PluginsPageDetail | null) => void;
+  onRead: (read: Promise<unknown>) => void;
 }): Promise<void> {
   const { pluginId, plugin, catalog: cachedCatalog, gateway } = params;
   const current = params.getDetail();
@@ -38,7 +38,6 @@ export async function loadInstalledPluginDetail(params: {
           (cachedCatalog && cachedCatalog.plugin.id === plugin?.catalogId
             ? cachedCatalog
             : undefined),
-        error: null,
       }
     : null;
   params.onChange(initial);
@@ -64,7 +63,9 @@ export async function loadInstalledPluginDetail(params: {
           .catch(() => undefined)
       : Promise.resolve(undefined);
   try {
-    const inspection = await inspectPlugin(client, plugin.id);
+    const read = inspectPlugin(client, plugin.id);
+    params.onRead(read);
+    const inspection = await read;
     if (!isCurrent()) {
       return;
     }
@@ -107,21 +108,22 @@ export async function loadInstalledPluginDetail(params: {
       // Remote enrichment is optional; settle its placeholder without hiding local controls.
       publish({ catalogLoading: false });
     }
-  } catch (error) {
-    publish({ error: formatUiError(error) });
+  } catch {
+    // The admitted read receipt presents failures without discarding accepted inspection.
   }
 }
 
 /** Reconcile the selected catalog identity against authoritative local inventory. */
 export async function loadPluginCatalogDetail(params: {
   id: string | null;
-  gateway: GatewayPageController;
+  gateway: GatewayPageBinding;
   context: Pick<ApplicationContext, "replace" | "basePath">;
   location: PluginsRouteData["location"] | undefined;
   inventory: PluginListResult | null;
   uninstalling: boolean;
   getDetail: () => PluginsPageCatalogDetail | null;
   onChange: (detail: PluginsPageCatalogDetail | null) => void;
+  onRead: (read: Promise<unknown>) => void;
   showInstalled: (pluginId: string | null) => Promise<void>;
 }): Promise<void> {
   const { id, gateway, context, location, inventory } = params;
@@ -141,7 +143,7 @@ export async function loadPluginCatalogDetail(params: {
     context.replace("plugins", { pathname: pathForRoute("plugins", context.basePath) });
     return;
   }
-  const detail: PluginsPageCatalogDetail | null = id ? { id, result: previous, error: null } : null;
+  const detail: PluginsPageCatalogDetail | null = id ? { id, result: previous } : null;
   if (current?.id !== id) {
     void params.showInstalled(null);
   }
@@ -168,7 +170,9 @@ export async function loadPluginCatalogDetail(params: {
   }
   void params.showInstalled(null);
   try {
-    const result = await loadPluginDiscoveryDetail(scope.client, detail.id);
+    const read = loadPluginDiscoveryDetail(scope.client, detail.id);
+    params.onRead(read);
+    const result = await read;
     if (gateway.isCurrent(scope) && params.getDetail() === detail) {
       params.onChange({ ...detail, result });
       void params.showInstalled(
@@ -176,9 +180,7 @@ export async function loadPluginCatalogDetail(params: {
       );
       clearInstallLink();
     }
-  } catch (error) {
-    if (gateway.isCurrent(scope) && params.getDetail() === detail) {
-      params.onChange({ ...detail, error: formatUiError(error) });
-    }
+  } catch {
+    // The admitted read receipt presents this failure; keep the accepted result.
   }
 }

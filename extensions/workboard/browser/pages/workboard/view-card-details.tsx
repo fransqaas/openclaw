@@ -9,23 +9,14 @@ import {
   WORKBOARD_ALL_BOARDS_FILTER,
 } from "../../lib/workboard/board-filter.ts";
 import { workboardBoardName } from "../../lib/workboard/board-presentation.ts";
-import {
-  addWorkboardCardComment,
-  getWorkboardDependencyState,
-  getWorkboardLifecycle,
-  getWorkboardState,
-  type WorkboardCard,
-  type WorkboardUiState,
-} from "../../lib/workboard/index.ts";
+import { getWorkboardDependencyState } from "../../lib/workboard/card-state.ts";
+import { getWorkboardLifecycle } from "../../lib/workboard/lifecycle.ts";
+import { addWorkboardCardComment } from "../../lib/workboard/mutations.ts";
+import { getWorkboardState } from "../../lib/workboard/runtime.ts";
+import type { WorkboardCard, WorkboardUiState } from "../../lib/workboard/types.ts";
 import { cardAgentLabel } from "./agent-filter.ts";
 import { automationDetailFields, BoardAutomation } from "./view-automation.tsx";
-import {
-  getCardActionState,
-  ArchiveCardAction,
-  DeleteCardAction,
-  EditCardAction,
-  StartExecutionButton,
-} from "./view-card-actions.tsx";
+import { getCardActionState, CardAction, StartExecutionButton } from "./view-card-actions.tsx";
 import {
   DependencyDetailList,
   DetailRow,
@@ -40,6 +31,7 @@ import {
   formatPriorityLabel,
   workboardErrorMessage,
   workboardMutationContext,
+  workboardViewState,
   renderPriorityIcon,
   formatStatusLabel,
   formatUpdatedTime,
@@ -112,10 +104,7 @@ function CardDetailsContent(props: WorkboardProps & { card: WorkboardCard }) {
     initialActiveElement instanceof HTMLElement && initialActiveElement !== document.body
       ? initialActiveElement
       : undefined;
-  const state = () => {
-    void props.revision;
-    return getWorkboardState(props.host);
-  };
+  const state = workboardViewState(() => props);
   const noteValue = liveInputValue(() => state().detailCommentBody);
   const visibleError = () => workboardErrorMessage(state(), props.pageError);
   const card = () => {
@@ -208,7 +197,9 @@ function CardDetailsContent(props: WorkboardProps & { card: WorkboardCard }) {
   const boardId = () => workboardCardBoardId(card());
   const board = () => state().boards.find((entry) => entry.id === boardId());
   const events = createMemo(() => (card().events ?? []).toReversed());
-  const dependencies = createMemo(() => getWorkboardDependencyState(card(), state().cards));
+  const dependencies = createMemo(() =>
+    getWorkboardDependencyState(card(), state().cards, !state().nextCursor),
+  );
   const technical = createMemo(() => technicalDetailsData(card(), action().linkedSessionKey));
   const tabs = () =>
     [
@@ -233,7 +224,7 @@ function CardDetailsContent(props: WorkboardProps & { card: WorkboardCard }) {
         label: card().title,
         description: lifecycle().session?.displayName ?? formatted().detail,
         style:
-          "--openclaw-modal-width: 620px; --openclaw-modal-backdrop-filter: none; --wa-color-overlay-modal: rgba(0, 0, 0, 0.24);",
+          "--openclaw-modal-width: 620px; --openclaw-modal-backdrop-filter: none; --openclaw-modal-backdrop-color: rgba(0, 0, 0, 0.24);",
         onCancel: dismissDetails,
       }}
     >
@@ -280,24 +271,27 @@ function CardDetailsContent(props: WorkboardProps & { card: WorkboardCard }) {
                       onClick={closeWorkboardPopoverOnAction}
                     >
                       {!action().archived ? (
-                        <EditCardAction
+                        <CardAction
+                          kind="edit"
                           workboard={props}
                           card={card()}
-                          options={{ requestAction: requestTransition }}
+                          requestAction={requestTransition}
                         />
                       ) : undefined}
-                      <ArchiveCardAction
+                      <CardAction
+                        kind="archive"
                         workboard={props}
                         card={card()}
                         busy={action().busy}
                         archived={action().archived}
-                        options={{ requestAction: requestTransition }}
+                        requestAction={requestTransition}
                       />
-                      <DeleteCardAction
+                      <CardAction
+                        kind="delete"
                         workboard={props}
                         card={card()}
                         busy={action().busy}
-                        options={{ requestAction: requestTransition }}
+                        requestAction={requestTransition}
                       />
                     </div>
                   </>
@@ -316,7 +310,7 @@ function CardDetailsContent(props: WorkboardProps & { card: WorkboardCard }) {
               class="workboard-detail__tabs"
               role="tablist"
               aria-label={t("workboard.detailTitle")}
-              onKeyDown={(event: KeyboardEvent) => {
+              onKeyDown={(event) => {
                 const index = tabs().findIndex((tab) => tab.id === activeTab());
                 let next: number;
                 if (event.key === "ArrowRight") {
@@ -336,11 +330,9 @@ function CardDetailsContent(props: WorkboardProps & { card: WorkboardCard }) {
                 }
                 event.preventDefault();
                 selectTab(nextTab.id, event.currentTarget);
-                if (event.currentTarget instanceof HTMLElement) {
-                  const buttons =
-                    event.currentTarget.querySelectorAll<HTMLButtonElement>("[role=tab]");
-                  buttons[next]?.focus();
-                }
+                const buttons =
+                  event.currentTarget.querySelectorAll<HTMLButtonElement>("[role=tab]");
+                buttons[next]?.focus();
               }}
             >
               <For each={tabs()} keyed={(tab) => tab.id}>
@@ -571,10 +563,7 @@ function CardDetailsContent(props: WorkboardProps & { card: WorkboardCard }) {
                         placeholder={t("workboard.detailNotePlaceholder")}
                         ref={noteValue}
                         disabled={action().busy}
-                        onInput={(event: InputEvent) => {
-                          if (!(event.currentTarget instanceof HTMLTextAreaElement)) {
-                            return;
-                          }
+                        onInput={(event) => {
                           state().detailCommentBody = event.currentTarget.value;
                           state().detailCommentDrafts.set(card().id, state().detailCommentBody);
                           props.onRequestUpdate?.();

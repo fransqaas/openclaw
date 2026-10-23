@@ -1,5 +1,5 @@
 {
-  "startupJsGzipBytes": 374285,
-  "reason": "Personal backgrounds: Peter authorized fix and landing on 2026-10-10 after the scoped 1,407 B (0.38%) cap proposal. Paired candidate measured 374,285 B before the final deferred-drain repair and 374,327 B afterward; the 42 B difference stays within the existing 512 B growth allowance. Retain the 64 B build-variance allowance and all request, CSS, asset, and route budgets.",
-  "updatedAt": "2026-10-10"
+  "startupJsGzipBytes": 315881,
+  "reason": "Creation transfer split preserves the stricter 315881 B startup baseline; matched 35637f41 builds measure 316324 to 316294 B startup, 1347441 B Chat and 822816 B New Session.",
+  "updatedAt": "2026-10-23"
 }

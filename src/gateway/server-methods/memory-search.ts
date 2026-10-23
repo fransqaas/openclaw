@@ -6,9 +6,12 @@ import type {
   MemoryCliSearchOutcome,
   MemoryProviderStatus,
   MemorySearchManager,
-  MemorySearchResult,
+  MemorySearchResponse,
 } from "../../memory-host-sdk/host/types.js";
-import { resolveMemorySearchStaleness } from "../../memory-host-sdk/host/types.js";
+import {
+  readMemorySearchManagerStatus,
+  resolveMemorySearchStaleness,
+} from "../../memory-host-sdk/host/types.js";
 import { normalizePluginsConfig } from "../../plugins/config-state.js";
 import {
   getActiveMemorySearchManagerCore,
@@ -18,23 +21,17 @@ import {
 import { loadBundledPluginPublicArtifactModuleSync } from "../../plugins/public-surface-loader.js";
 import { normalizeAgentId } from "../../routing/session-key.js";
 import {
+  captureChannelReadScope,
+  withChannelReadAuthority,
+} from "../../shared/channel-read-authority.js";
+import {
+  captureLocalStateMutationGuard,
   localStateOwnerChangedError,
-  runWithLocalStateMutationOwner,
 } from "./local-state-owner.js";
 import type { GatewayRequestHandlerOptions, GatewayRequestHandlers } from "./types.js";
 
 const DEFAULT_MAX_RESULTS = 20;
 const MAX_RESULTS = 50;
-
-export type MemorySearchResponse = {
-  agentId: string;
-  provider: string;
-  searchMode: "hybrid" | "fts-only";
-  results: MemorySearchResult[];
-  stale?: true;
-  warning?: string;
-  action?: string;
-};
 
 function resolveSearchMode(status: MemoryProviderStatus): MemorySearchResponse["searchMode"] {
   const statusMode = status.custom?.searchMode;
@@ -182,7 +179,15 @@ async function searchMemory(options: GatewayRequestHandlerOptions, assertCurrent
     );
     return;
   }
-  let acquired: Awaited<ReturnType<typeof getActiveMemorySearchManagerCore>>;
+  let acquired: Awaited<ReturnType<typeof getActiveMemorySearchManagerCore>> | undefined;
+  const readScope = assertCurrent ? captureChannelReadScope() : undefined;
+  // Register before acquisition so revoked reads still close the returned manager.
+  readScope?.registerResource({
+    key: "memory-search-manager",
+    settle: async () => {
+      await acquired?.manager?.close?.();
+    },
+  });
   try {
     // Use the transient CLI lifecycle so request cleanup cannot close a shared manager.
     // manager.search owns the same lazy/on-search sync behavior as the existing CLI path.
@@ -240,9 +245,9 @@ async function searchMemory(options: GatewayRequestHandlerOptions, assertCurrent
     const { captureMemoryRebuildNotice } = loadBundledPluginPublicArtifactModuleSync<{
       captureMemoryRebuildNotice: (status: MemoryProviderStatus) => () => string | undefined;
     }>({ dirName: "memory-core", artifactBasename: "search-api.js" });
-    readRebuildWarning = captureMemoryRebuildNotice(manager.status());
+    readRebuildWarning = captureMemoryRebuildNotice(await readMemorySearchManagerStatus(manager));
     const results = await manager.search(searchQuery, searchOptions);
-    const status = manager.status();
+    const status = await readMemorySearchManagerStatus(manager);
     const staleness = resolveMemorySearchStaleness(status, agentId);
     const warning = [staleness?.warning, readRebuildWarning()]
       .filter((message): message is string => typeof message === "string")
@@ -268,9 +273,7 @@ async function searchMemory(options: GatewayRequestHandlerOptions, assertCurrent
       ),
     );
   } finally {
-    if (assertCurrent) {
-      await manager.close?.();
-    } else {
+    if (!readScope) {
       await manager.close?.().catch(() => {});
     }
   }
@@ -299,12 +302,12 @@ export const memorySearchHandlers: GatewayRequestHandlers = {
     }
     let domainEntered = false;
     try {
-      let response: Parameters<GatewayRequestHandlerOptions["respond"]> | undefined;
-      const assertOwnerCurrent = await runWithLocalStateMutationOwner(
-        expectedOwnerId,
-        options,
-        async (assertCurrent) => {
+      const assertCurrent = captureLocalStateMutationGuard(expectedOwnerId, options);
+      await withChannelReadAuthority(
+        assertCurrent,
+        async () => {
           domainEntered = true;
+          let response: Parameters<GatewayRequestHandlerOptions["respond"]> | undefined;
           await searchMemory(
             {
               ...options,
@@ -314,13 +317,15 @@ export const memorySearchHandlers: GatewayRequestHandlers = {
             },
             assertCurrent,
           );
-          return assertCurrent;
+          return response;
+        },
+        options.signal,
+        (response) => {
+          if (response) {
+            options.respond(...response);
+          }
         },
       );
-      assertOwnerCurrent();
-      if (response) {
-        options.respond(...response);
-      }
     } catch (error) {
       options.respond(
         false,

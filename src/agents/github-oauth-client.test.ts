@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { withinTest } from "../../test/helpers/promise.js";
 import { clearRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import { redactRegisteredSecretValues } from "../logging/secret-redaction-registry.js";
 import { createDeferredCore } from "../shared/deferred.js";
+import { isRecoverableOAuthRefreshFailure } from "../shared/oauth-refresh-outcome.js";
 import {
   clearGitHubCredentialVerificationCache,
   pollGitHubOAuthDeviceToken,
@@ -87,6 +89,44 @@ describe("GitHub OAuth client", () => {
       status: "unavailable",
     });
     expect(probe).toHaveBeenCalledTimes(3);
+  });
+
+  it("serves stale display facts while strict verification waits for revocation", async ({
+    signal,
+  }) => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const refresh = createDeferredCore<Response>();
+    const probe = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse({ id: 204, login: "display-account" }))
+      .mockReturnValueOnce(refresh.promise)
+      .mockResolvedValue(jsonResponse({}, 401));
+    const token = "synthetic-stale-display-token";
+    const first = await verifyGitHubCredential(token);
+    now.mockReturnValue(61_001);
+    try {
+      expect(await withinTest(verifyGitHubCredential(token, { allowStale: true }), signal)).toEqual(
+        { ...first, stale: true },
+      );
+      expect(await verifyGitHubCredential(token, { allowStale: true })).toEqual({
+        ...first,
+        stale: true,
+      });
+      let settled = false;
+      const strict = verifyGitHubCredential(token).then((result) => {
+        settled = true;
+        return result;
+      });
+      expect(settled).toBe(false);
+      refresh.resolve(jsonResponse({}, 401));
+      expect(await strict).toEqual({ status: "unavailable" });
+      expect(await verifyGitHubCredential(token, { allowStale: true })).toEqual({
+        status: "unavailable",
+      });
+      expect(probe).toHaveBeenCalledTimes(3);
+    } finally {
+      refresh.resolve(jsonResponse({}, 401));
+    }
   });
 
   it("keeps different tokens separate while sharing concurrent probes for one token", async () => {
@@ -204,8 +244,6 @@ describe("GitHub OAuth client", () => {
       expected: {
         status: "slow_down",
         intervalSeconds: 12,
-        errorDescription: "Continue at the returned interval",
-        errorUri: "https://docs.github.com/apps/oauth-apps",
       },
     },
     {
@@ -230,7 +268,25 @@ describe("GitHub OAuth client", () => {
     ).resolves.toEqual({
       status: "error",
       code: "bad_refresh_token",
+      failure: expect.objectContaining({
+        oauthRefreshOutcome: expect.objectContaining({
+          outcome: "rejected",
+          reason: "invalid_grant",
+        }),
+      }),
     });
+  });
+
+  it("restores only a refresh that its current-authority guard prevented from dispatching", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch");
+    const failure = await refreshGitHubOAuthToken({
+      refreshToken: "synthetic-refresh",
+      assertCurrent: async () => {
+        throw new Error("authority retired");
+      },
+    }).catch((error: unknown) => error);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(isRecoverableOAuthRefreshFailure(failure)).toBe(true);
   });
 
   it.each([

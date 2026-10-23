@@ -7,6 +7,7 @@ import { ensurePluginAllowlisted } from "../config/plugins-allowlist.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { PluginInstallRecord } from "../config/types.plugins.js";
 import { composeConfigWriteAssertions } from "../config/write-authority.js";
+import { readDeferredPluginMigrationsAsync } from "../infra/deferred-plugin-migrations.js";
 import { isPathInside } from "../infra/path-guards.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
 import { resolveUserPath, shortenHomePath } from "../utils.js";
@@ -14,6 +15,7 @@ import {
   isPluginCandidateInstallOwnerAmbiguous,
   resolvePluginCandidateInstallOwner,
 } from "./candidate-install-owner.js";
+import { normalizePluginId, normalizePluginsConfig } from "./config-state.js";
 import { discoverOpenClawPlugins } from "./discovery.js";
 import { enablePluginInConfig, prepareConfigForDisabledInstall } from "./enable.js";
 import type { ConfigSnapshotForInstallPersist } from "./install-config-mutation.js";
@@ -59,10 +61,11 @@ import {
 
 function removeInstalledPluginFromDenylist(cfg: OpenClawConfig, pluginId: string): OpenClawConfig {
   const deny = cfg.plugins?.deny;
-  if (!Array.isArray(deny) || !deny.includes(pluginId)) {
+  const policyId = normalizePluginId(pluginId);
+  if (!Array.isArray(deny) || !deny.some((id) => normalizePluginId(id) === policyId)) {
     return cfg;
   }
-  const nextDeny = deny.filter((id) => id !== pluginId);
+  const nextDeny = deny.filter((id) => normalizePluginId(id) !== policyId);
   const plugins = {
     ...cfg.plugins,
     ...(nextDeny.length > 0 ? { deny: nextDeny } : {}),
@@ -92,7 +95,6 @@ async function logShadowedNpmInstallWarning(params: {
   }
   const report = await buildPluginSnapshotReportAsync({
     config: params.config,
-    effectiveOnly: true,
     onlyPluginIds: [params.pluginId],
   });
   const active = report.plugins.find((plugin) => plugin.id === params.pluginId);
@@ -290,7 +292,12 @@ async function persistPluginInstallOwned(
       }
       const ownedPluginIds = manifests.map((plugin) => plugin.id).toSorted();
       const prepareMigration = async () => {
-        const prepared = await readConfigFileSnapshotForWrite();
+        const deferredPluginMigrations = await readDeferredPluginMigrationsAsync();
+        assertOwned();
+        params.beforePersistentApply?.();
+        const prepared = await readConfigFileSnapshotForWrite({
+          deferredPluginMigrations,
+        });
         assertOwned();
         params.beforePersistentApply?.();
         if (
@@ -336,9 +343,10 @@ async function persistPluginInstallOwned(
 
       let next = reconciledConfig;
       const enabledPluginIds: string[] = [];
+      const policyEntries = normalizePluginsConfig(reconciledConfig.plugins).entries;
       for (const pluginId of ownedPluginIds) {
         const configEnablement = enablementByPluginId.get(pluginId) ?? { mode: "ready" as const };
-        const explicitlyDisabled = reconciledConfig.plugins?.entries?.[pluginId]?.enabled === false;
+        const explicitlyDisabled = policyEntries[normalizePluginId(pluginId)]?.enabled === false;
         if (configEnablement.mode === "missing") {
           next = prepareConfigForDisabledInstall(next, pluginId);
         }
@@ -413,6 +421,7 @@ async function persistPluginInstallOwned(
               beforePersistentEffect: params.beforePersistentEffect,
               writeOptions: {
                 ...params.snapshot.writeOptions,
+                deferredPluginMigrations: migration?.deferredPluginMigrations,
                 afterWrite:
                   params.applyRuntime || params.deferRuntime || migration?.activationWarning
                     ? { mode: "none", reason: "plugin lifecycle applies runtime" }
@@ -436,15 +445,12 @@ async function persistPluginInstallOwned(
       if (activationWarning) {
         warn(activationWarning, activationWarning);
       } else {
-        params.deferRuntime?.record(
-          {
-            operation: "install",
-            pluginId: params.pluginId,
-            sourceDigests: source?.sourceDigests ?? {},
-            write: receipt,
-          },
-          source?.assertSourceCurrent,
-        );
+        params.deferRuntime?.record({
+          operation: "install",
+          pluginId: params.pluginId,
+          sourceDigests: source?.sourceDigests ?? {},
+          write: receipt,
+        });
         await refreshManagedPluginMetadata({
           config: next,
           assertCurrent: params.beforePersistentApply,

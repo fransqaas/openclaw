@@ -14,10 +14,13 @@ type PrewarmedSnapshot = {
   cacheKey: string;
   cancelled: boolean;
   promise: Promise<unknown>;
-  readyAt?: number;
 };
 
 let pending: PrewarmedSnapshot | undefined;
+
+export function peekPrewarmedChatSnapshot(): PrewarmedSnapshot | undefined {
+  return pending;
+}
 
 export function discardPrewarmedChatSnapshot(cacheKey?: string): void {
   if (pending && (cacheKey === undefined || pending.cacheKey === cacheKey)) {
@@ -42,9 +45,7 @@ export function prewarmChatSnapshot(cacheKey: string): void {
   pending = entry;
 }
 
-export function consumePrewarmedChatSnapshot(
-  cacheKey: string,
-): Pick<PrewarmedSnapshot, "promise" | "readyAt"> | undefined {
+export function consumePrewarmedChatSnapshot(cacheKey: string): PrewarmedSnapshot | undefined {
   if (pending?.cacheKey !== cacheKey) {
     return undefined;
   }
@@ -53,11 +54,6 @@ export function consumePrewarmedChatSnapshot(
   return prewarm;
 }
 
-export function markPrewarmedChatSnapshotReady(): void {
-  if (pending) {
-    pending.readyAt ??= Date.now();
-  }
-}
 subscribeSnapshotInvalidation((invalidation) => {
   const { sessionKey, scopePrefix } = invalidation;
   if (!scopePrefix || pending?.cacheKey.startsWith(scopePrefix)) {

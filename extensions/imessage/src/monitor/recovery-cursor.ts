@@ -24,6 +24,7 @@ const LEGACY_CATCHUP_CURSOR_NAMESPACE = "imessage.catchup-cursors";
 const LEGACY_CATCHUP_CURSOR_MAX_ENTRIES = 256;
 
 type RecoveryCursor = { lastRowid: number };
+let cursorWrites: Promise<unknown> = Promise.resolve();
 
 function openRecoveryCursorStore() {
   return getIMessageRuntime().state.openKeyedStoreV2<RecoveryCursor>(RECOVERY_CURSOR_STORE_OPTIONS);
@@ -103,51 +104,44 @@ function decideRecoveryCursorUpdate(
   return { lastRowid: update.rowid };
 }
 
-async function applyRecoveryCursorUpdate(
+function applyRecoveryCursorUpdate(
   key: string,
   update: RecoveryCursorUpdate,
 ): Promise<RecoveryCursor | undefined> {
-  const store = openRecoveryCursorStore();
-  let observation = await store.observe(key);
-  for (;;) {
-    const next = decideRecoveryCursorUpdate(observation.value, update);
+  // This module owns cursor writes. Serialize ordinary concurrent completions;
+  // direct writes by another owner during this operation are best effort.
+  const write = cursorWrites.then(async () => {
+    const store = openRecoveryCursorStore();
+    const current = await store.lookup(key);
+    const next = decideRecoveryCursorUpdate(current, update);
     if (!next) {
-      return observation.value;
+      return current;
     }
-    const result = await store.compareAndApply(key, observation.comparison, {
-      operation: "update",
-      action: "set",
-      value: next,
-    });
-    if (result.status !== "conflict") {
-      return next;
-    }
-    observation = result.current;
-  }
+    await store.register(key, next);
+    return next;
+  });
+  cursorWrites = write.catch(() => {});
+  return write;
 }
 
 async function readRecoveryCursor(accountId: string, dbIdentity: string): Promise<number | null> {
-  try {
-    const store = openRecoveryCursorStore();
-    const key = recoveryCursorStoreKey(accountId, dbIdentity);
-    const value = await store.lookup(key);
-    if (value) {
-      return Number.isFinite(value.lastRowid) ? value.lastRowid : null;
-    }
-    // One-time upgrade adoption: cursors written before database scoping were
-    // keyed by accountId alone. Adopt such an entry for the active database so
-    // the upgrade restart still replays downtime rows, then consume it so a
-    // later dbPath change cannot inherit this database's high-water.
-    const legacy = await store.consume(accountId);
-    if (legacy && Number.isFinite(legacy.lastRowid)) {
-      await store.registerIfAbsent(key, { lastRowid: legacy.lastRowid });
-      const adopted = await store.lookup(key);
-      return adopted && Number.isFinite(adopted.lastRowid) ? adopted.lastRowid : null;
-    }
-    return null;
-  } catch {
-    return null;
+  const store = openRecoveryCursorStore();
+  const key = recoveryCursorStoreKey(accountId, dbIdentity);
+  const value = await store.lookup(key);
+  if (value) {
+    return Number.isFinite(value.lastRowid) ? value.lastRowid : null;
   }
+  // One-time upgrade adoption: cursors written before database scoping were
+  // keyed by accountId alone. Adopt such an entry for the active database so
+  // the upgrade restart still replays downtime rows, then consume it so a
+  // later dbPath change cannot inherit this database's high-water.
+  const legacy = await store.consume(accountId);
+  if (legacy && Number.isFinite(legacy.lastRowid)) {
+    await store.registerIfAbsent(key, { lastRowid: legacy.lastRowid });
+    const adopted = await store.lookup(key);
+    return adopted && Number.isFinite(adopted.lastRowid) ? adopted.lastRowid : null;
+  }
+  return null;
 }
 
 // One-time, self-cleaning migration: when the recovery cursor is empty (first
@@ -157,24 +151,20 @@ async function migrateLegacyCatchupCursor(
   accountId: string,
   dbIdentity: string,
 ): Promise<number | null> {
-  try {
-    const legacy = getIMessageRuntime().state.openKeyedStoreV2<{ lastSeenRowid?: unknown }>({
-      namespace: LEGACY_CATCHUP_CURSOR_NAMESPACE,
-      maxEntries: LEGACY_CATCHUP_CURSOR_MAX_ENTRIES,
-    });
-    const key = createHash("sha256").update(accountId, "utf8").digest("hex").slice(0, 32);
-    const value = await legacy.consume(key);
-    const rowid =
-      typeof value?.lastSeenRowid === "number" && Number.isFinite(value.lastSeenRowid)
-        ? value.lastSeenRowid
-        : null;
-    if (rowid !== null) {
-      await advanceIMessageRecoveryCursor(accountId, dbIdentity, rowid);
-    }
-    return rowid;
-  } catch {
-    return null;
+  const legacy = getIMessageRuntime().state.openKeyedStoreV2<{ lastSeenRowid?: unknown }>({
+    namespace: LEGACY_CATCHUP_CURSOR_NAMESPACE,
+    maxEntries: LEGACY_CATCHUP_CURSOR_MAX_ENTRIES,
+  });
+  const key = createHash("sha256").update(accountId, "utf8").digest("hex").slice(0, 32);
+  const value = await legacy.consume(key);
+  const rowid =
+    typeof value?.lastSeenRowid === "number" && Number.isFinite(value.lastSeenRowid)
+      ? value.lastSeenRowid
+      : null;
+  if (rowid !== null) {
+    await advanceIMessageRecoveryCursor(accountId, dbIdentity, rowid);
   }
+  return rowid;
 }
 
 async function reconcileRecoveryCursorToWatermark(
@@ -206,7 +196,7 @@ async function reconcileRecoveryCursorToWatermark(
 export async function loadIMessageRecoveryCursor(
   accountId: string,
   dbIdentity: string,
-  options: { migrateLegacyCatchup?: boolean; watermarkRowid?: number | null } = {},
+  options: { watermarkRowid?: number | null } = {},
 ): Promise<number | null> {
   const watermarkRowid =
     typeof options.watermarkRowid === "number" && Number.isFinite(options.watermarkRowid)
@@ -215,9 +205,6 @@ export async function loadIMessageRecoveryCursor(
   const current = await readRecoveryCursor(accountId, dbIdentity);
   if (current !== null) {
     return await reconcileRecoveryCursorToWatermark(accountId, dbIdentity, current, watermarkRowid);
-  }
-  if (options.migrateLegacyCatchup === false) {
-    return null;
   }
   return await reconcileRecoveryCursorToWatermark(
     accountId,

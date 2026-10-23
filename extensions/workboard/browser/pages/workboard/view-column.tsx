@@ -4,12 +4,8 @@ import { createMemo, For, onSettled } from "solid-js";
 import { icons } from "../../components/icons.tsx";
 import { t } from "../../i18n/index.ts";
 import { isActiveWorkboardCard } from "../../lib/workboard/card-state.ts";
-import {
-  getWorkboardState,
-  moveWorkboardCard,
-  type WorkboardCard,
-  type WorkboardStatus,
-} from "../../lib/workboard/index.ts";
+import { moveWorkboardCard } from "../../lib/workboard/mutations.ts";
+import type { WorkboardCard, WorkboardStatus } from "../../lib/workboard/types.ts";
 import { matchesAgentScope } from "./agent-filter.ts";
 import { matchesBoardFilter } from "./board-filter.ts";
 import { openCreateModal, workboardCardModalId } from "./view-card-modal.tsx";
@@ -18,6 +14,7 @@ import {
   canMutate,
   formatStatusLabel,
   workboardMutationContext,
+  workboardViewState,
   type WorkboardProps,
 } from "./view-helpers.tsx";
 import { workboardPopoverRef } from "./view-popover.ts";
@@ -48,10 +45,7 @@ export function WorkboardColumn(input: {
     boardFilter?: string;
   };
 }) {
-  const state = () => {
-    void input.workboard.revision;
-    return getWorkboardState(input.workboard.host);
-  };
+  const state = workboardViewState(() => input.workboard);
   const writable = createMemo(() => {
     state();
     return canMutate(input.workboard);

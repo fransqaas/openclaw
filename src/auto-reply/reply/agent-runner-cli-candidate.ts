@@ -11,11 +11,13 @@ import {
 import { shouldClearFailedCliSessionBinding } from "../../agents/cli-session.js";
 import { resolveDelegationCapability } from "../../agents/delegation-capability.js";
 import { withAdmittedCliCandidate } from "../../agents/embedded-agent-runner/run-entry-cli.js";
+import type { CompactionAccountingTarget } from "../../agents/embedded-agent-runner/run/internal-params.js";
 import {
   getGeneratedMediaTaskIdsForSessionKey,
   hasNewGeneratedMediaTaskForSessionKey,
 } from "../../agents/media-generation-activity.js";
 import { findModelInCatalog } from "../../agents/model-catalog-lookup.js";
+import { recordModelFallbackStop } from "../../agents/model-fallback-stop.js";
 import { normalizeChatType } from "../../channels/chat-type.js";
 import { shouldPreserveUserFacingSessionStateForInputProvenance } from "../../sessions/input-provenance.js";
 import { createAgentLifecycleTerminalBackstop } from "./agent-lifecycle-terminal.js";
@@ -33,6 +35,7 @@ import {
   buildFallbackCandidateTurnParams,
   buildReplyRunStateParams,
   resolveRunModelHasVision,
+  resolveReplyScheduledToolPolicy,
 } from "./agent-runner-run-params.js";
 import { buildReplyRouteThreadingToolContext } from "./agent-runner-utils.js";
 import { prepareCliReplyPayload } from "./cli-reply-payload.js";
@@ -46,9 +49,11 @@ export async function runCliFallbackCandidate(
   params: AgentFallbackCandidateCommonParams & {
     cliExecutionProvider: string;
     lifecycleGeneration: string;
+    onSessionWriter: (writer: CompactionAccountingTarget) => void;
   },
 ): ReturnType<typeof runCliAgentWithLifecycle> {
   const turn = params.turn;
+  params.scheduledInference?.assertCandidate(params.provider, true);
   const onPreparedBlockReply = turn.opts?.onPreparedBlockReply;
   const onNativeBlockReply: NonNullable<typeof turn.opts>["onBlockReply"] =
     turn.opts?.onBlockReply ??
@@ -194,19 +199,41 @@ export async function runCliFallbackCandidate(
             storePath: turn.storePath,
             activeSessionEntry: sessionEntry,
           });
+        const scheduledInference = params.scheduledInference;
         // The CLI owner must see explicit pins before provider scoping can discard them.
-        const authProfileId = allowCliAuthProfileForwarding
-          ? resolveCliExecutionAuthProfileId({
-              cliExecutionProvider: params.cliExecutionProvider,
-              authProfileProvider: params.provider,
-              config: params.runtimeConfig,
-              agentDir: params.candidateRun.agentDir,
-              selected: params.candidateRun,
-              sessionBinding: cliSessionBinding,
-            })
-          : resolveRunAuthProfile(params.candidateRun, params.cliExecutionProvider, {
-              config: params.runtimeConfig,
-            }).authProfileId;
+        // A recorded account runs only when this backend forwards exactly that account.
+        const authProfileId = scheduledInference
+          ? await scheduledInference.resolveCliAuthProfile(async (selected) =>
+              allowCliAuthProfileForwarding
+                ? await resolveCliExecutionAuthProfileId({
+                    cliExecutionProvider: params.cliExecutionProvider,
+                    authProfileProvider: params.provider,
+                    config: params.runtimeConfig,
+                    agentDir: params.candidateRun.agentDir,
+                    selected,
+                    sessionBinding: cliSessionBinding,
+                  })
+                : undefined,
+            )
+          : allowCliAuthProfileForwarding
+            ? await resolveCliExecutionAuthProfileId({
+                cliExecutionProvider: params.cliExecutionProvider,
+                authProfileProvider: params.provider,
+                config: params.runtimeConfig,
+                agentDir: params.candidateRun.agentDir,
+                selected: params.candidateRun,
+                sessionBinding: cliSessionBinding,
+              })
+            : resolveRunAuthProfile(params.candidateRun, params.cliExecutionProvider, {
+                config: params.runtimeConfig,
+              }).authProfileId;
+        if (turn.followupRun.run.scheduledAutomation && !scheduledInference && authProfileId) {
+          const refusal = new Error(
+            "Automation has no recorded inference account. Explicitly select its account with a model@profile update before running it.",
+          );
+          recordModelFallbackStop(refusal);
+          throw refusal;
+        }
         const diagnosticOwner = params.deferredLifecycle.handoffToCli();
         // A forked child carries the parent's binding with a one-shot fork marker;
         // honor it here or the child resumes inside the parent's native thread.
@@ -241,6 +268,9 @@ export async function runCliFallbackCandidate(
           lifecycleGeneration: params.lifecycleGeneration,
           startedAt: cliLifecycleStartedAt,
           onAgentRunStart: params.notifyAgentRunStart,
+          deferLifecycleStartUntilExecution: turn.followupRun.run.scheduledAutomation
+            ? true
+            : undefined,
           suppressAssistantBridge: turn.followupRun.run.silentExpected,
           onActivity: () => turn.replyOperation?.recordActivity(),
           onErrorBeforeLifecycle:
@@ -361,6 +391,42 @@ export async function runCliFallbackCandidate(
             runtimePolicySessionKey:
               turn.followupRun.run.runtimePolicySessionKey ?? turn.runtimePolicySessionKey,
             agentId: turn.followupRun.run.agentId,
+            jobId: turn.followupRun.run.scheduledAutomation?.job.id,
+            onExecutionStarted: turn.followupRun.run.scheduledAutomation
+              ? async () => {
+                  try {
+                    await turn.followupRun.run.internalEventExecution?.beforeScheduledStart?.(
+                      params.runId,
+                    );
+                    params.runAbortSignal?.throwIfAborted();
+                    turn.followupRun.run.internalEventExecution?.assertCurrent?.();
+                    const automation = turn.followupRun.run.scheduledAutomation;
+                    if (automation && sessionKey) {
+                      automation.onExecutionStarted?.({
+                        runId: params.runId,
+                        sessionId: turn.followupRun.run.sessionId,
+                        sessionKey,
+                        provider: params.provider,
+                        model: params.model,
+                        ...(params.isFallbackRetry ? { isFallback: true } : {}),
+                      });
+                    }
+                  } catch (error) {
+                    if (!params.hasAgentRunStarted()) {
+                      lifecycleBackstop.note({
+                        stream: "lifecycle",
+                        data: {
+                          phase: "finishing",
+                          executionStarted: false,
+                          providerStarted: false,
+                        },
+                      });
+                    }
+                    throw error;
+                  }
+                }
+              : undefined,
+            scheduledToolPolicy: resolveReplyScheduledToolPolicy(turn.followupRun.run),
             config: params.runtimeConfig,
             persistAssistantTranscript:
               turn.followupRun.currentInboundEventKind !== "room_event" &&
@@ -400,8 +466,19 @@ export async function runCliFallbackCandidate(
             forkCliSessionOnResume,
             ...forkRunParams,
             authProfileId,
+            // The CLI owner rechecks this after awaits and before credential/transport effects.
+            assertCurrent: scheduledInference
+              ? () => {
+                  assertSettlementCurrent();
+                  scheduledInference.runParams.authProfileBinding?.assertCurrent();
+                }
+              : undefined,
+            nativeAuthOnly:
+              turn.followupRun.run.scheduledAutomation && !params.scheduledInference
+                ? true
+                : undefined,
             mediaImageLayout: params.currentTurnImages.mediaImageLayout,
-            messageChannel: turn.followupRun.originatingChannel ?? undefined,
+            messageChannel: turn.followupRun.originatingChannel,
             messageProvider: hookMessageProvider,
             currentChannelId:
               turn.followupRun.originatingTo ?? turn.sessionCtx.OriginatingTo ?? turn.sessionCtx.To,
@@ -428,6 +505,14 @@ export async function runCliFallbackCandidate(
             onExecutionPhase: params.signalExecutionPhaseForTyping,
           },
         });
+        if (sessionTarget && sessionEntry) {
+          // History preparation publishes its committed writer into this candidate's detached row.
+          params.onSessionWriter({
+            ...sessionTarget,
+            lifecycleRevision: sessionEntry.lifecycleRevision,
+            activeWriterRunId: sessionEntry.activeWriterRunId,
+          });
+        }
         if (droppedCliSessionReplacement) {
           // The room-event transform removed native continuity; only its guarded
           // invalidation remains, and failure must retain the returned turn.

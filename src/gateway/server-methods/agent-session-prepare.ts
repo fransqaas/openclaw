@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { ErrorCodes, errorShape } from "../../../packages/gateway-protocol/src/index.js";
 import { hasGeneratedMediaCompletionEvent } from "../../agents/internal-event-contract.js";
@@ -18,10 +17,13 @@ import {
   resolveAgentSessionWorkStartError,
   type RestoredCronContinuation,
 } from "../agent-turn/agent-handler-helpers.js";
+import {
+  takeInProcessFreshChildSession,
+  type FreshChildSession,
+} from "../in-process-session-run.js";
 import { resolveRequestedSessionAgentId } from "../session-request-agent.js";
 import { loadGatewaySessionEntryReadOnlyInWorker } from "../session-utils-store-worker.js";
 import type { AgentRunRequest } from "./agent-request-types.js";
-import { evaluateAgentSessionReuse } from "./agent-session-patch.js";
 import type { GatewayRequestHandlerOptions } from "./types.js";
 
 type PrepareAgentSessionParams = {
@@ -34,7 +36,7 @@ type PrepareAgentSessionParams = {
   request: AgentRunRequest;
   canUseCronRunContinuation: boolean;
   lifecycleGeneration: string;
-  effectiveBootstrapContextRunKind?: "default" | "heartbeat" | "cron";
+  effectiveBootstrapContextRunKind?: "default" | "cron";
   preAttachmentSession?: { canonicalKey: string; sessionId?: string };
   respond: GatewayRequestHandlerOptions["respond"];
   assertCurrent?: () => void;
@@ -52,6 +54,22 @@ export async function prepareAgentSession(params: PrepareAgentSessionParams) {
     return undefined;
   }
   const requestedAgentId = requestedSessionAgent.agentId;
+  const freshChild = takeInProcessFreshChildSession(params.request);
+  if (freshChild) {
+    return prepareAdmittedAgentSession(
+      params,
+      {
+        cfg: params.cfg,
+        storePath: freshChild.storePath,
+        entry: freshChild.entry,
+        canonicalKey: params.requestedSessionKey,
+        storeKeys: [params.requestedSessionKey],
+        legacyKey: undefined,
+      },
+      freshChild.agentId,
+      freshChild,
+    );
+  }
   const selected = await loadGatewaySessionEntryReadOnlyInWorker({
     cfg: params.cfg,
     key: params.requestedSessionKey,
@@ -64,8 +82,12 @@ export async function prepareAgentSession(params: PrepareAgentSessionParams) {
 
 async function prepareAdmittedAgentSession(
   params: PrepareAgentSessionParams,
-  selected: Awaited<ReturnType<typeof loadGatewaySessionEntryReadOnlyInWorker>>,
+  selected: Pick<
+    Awaited<ReturnType<typeof loadGatewaySessionEntryReadOnlyInWorker>>,
+    "cfg" | "storePath" | "readSource" | "entry" | "canonicalKey" | "legacyKey" | "storeKeys"
+  >,
   requestedAgentId: string,
+  freshChild?: FreshChildSession,
 ) {
   const { cfg, storePath, entry, canonicalKey, legacyKey, storeKeys } = selected;
   const canonicalSessionAgentId = parseAgentSessionKey(canonicalKey)?.agentId ?? requestedAgentId;
@@ -185,29 +207,14 @@ async function prepareAdmittedAgentSession(
       channel: sessionDeliveryChannel(entry) ?? params.recipientChannel,
     }),
   });
-  const isSystemGatewayRun =
-    effectiveBootstrapContextRunKind === "cron" || effectiveBootstrapContextRunKind === "heartbeat";
+  const isSystemGatewayRun = effectiveBootstrapContextRunKind === "cron";
   const visibleRequest = !isSystemGatewayRun && !params.request.internalEvents?.length;
   const mainSessionKey = resolveAgentMainSessionKey({ cfg, agentId: canonicalSessionAgentId });
-  const reuse = await evaluateAgentSessionReuse({
-    freshEntry: entry,
-    cfg,
-    sessionAgentId: canonicalSessionAgentId,
-    canonicalSessionKey: canonicalKey,
-    storePath,
-    expectedExistingSessionId: params.expectedExistingSessionId,
-    hasRestoredCronContinuation: restoredCronContinuationIdentity !== undefined,
-    resetPolicy,
-    now,
-    requestedSessionId: params.requestedSessionId,
-    isSystemGatewayRun,
-    visibleRequest,
-  });
   params.assertCurrent?.();
-  const sessionId = reuse.sessionId ?? randomUUID();
   return {
     cfg,
     storePath,
+    physicalStorePath: selected.readSource?.path,
     entry,
     canonicalKey,
     storeKeys,
@@ -215,17 +222,13 @@ async function prepareAdmittedAgentSession(
     canonicalSessionAgentId,
     resetPolicy,
     now,
-    freshness: reuse.freshness,
     visibleRequest,
     mainSessionKey,
     isSystemGatewayRun,
-    usableRequestedSessionId: reuse.usableRequestedSessionId,
-    sessionId,
-    isNewSession: reuse.isNewSession,
-    rotatedSessionId: Boolean(entry?.sessionId && entry.sessionId !== sessionId),
     touchInteraction: visibleRequest,
     sessionPersistedBeforeGatewayAdmission: entry !== undefined,
     effectiveBootstrapContextRunKind,
     restoredCronContinuationIdentity,
+    freshChild: freshChild !== undefined,
   };
 }

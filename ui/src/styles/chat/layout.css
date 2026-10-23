@@ -777,7 +777,7 @@ openclaw-pending-session-create {
   text-transform: uppercase;
 }
 
-.chat-history-boundary__action:not(:disabled):hover {
+.chat-history-boundary__action:not([aria-disabled="true"]):hover {
   color: var(--text);
 }
 
@@ -793,6 +793,11 @@ openclaw-pending-session-create {
   }
 }
 
+.chat {
+  --chat-scroll-to-bottom-size: 36px;
+  --chat-scroll-to-bottom-gap: 12px;
+}
+
 /* The zero-height anchor keeps the affordance out of the flex flow so showing
    it never shrinks the transcript or moves the composer. */
 .chat-scroll-to-bottom-wrap {
@@ -805,13 +810,13 @@ openclaw-pending-session-create {
 
 .chat-scroll-to-bottom {
   position: absolute;
-  bottom: 12px;
+  bottom: calc(var(--chat-scroll-to-bottom-gap) + var(--chat-scroll-to-bottom-clearance, 0px));
   left: 50%;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 36px;
-  height: 36px;
+  width: var(--chat-scroll-to-bottom-size);
+  height: var(--chat-scroll-to-bottom-size);
   padding: 0;
   line-height: 1;
   color: var(--text);
@@ -828,8 +833,7 @@ openclaw-pending-session-create {
     transform var(--duration-slow) var(--ease-in-out),
     opacity var(--duration-slow) var(--ease-in-out),
     background-color var(--duration-fast) var(--ease-out),
-    border-color var(--duration-fast) var(--ease-out),
-    visibility 0s linear var(--duration-slow);
+    border-color var(--duration-fast) var(--ease-out);
 }
 
 .chat-scroll-to-bottom[data-visible="true"] {
@@ -878,17 +882,6 @@ openclaw-pending-session-create {
 .chat-scroll-to-bottom:focus-visible {
   outline: 2px solid color-mix(in srgb, var(--text) 28%, transparent);
   outline-offset: 2px;
-}
-
-.chat-scroll-to-bottom svg {
-  width: 16px;
-  height: 16px;
-  stroke: currentColor;
-  fill: none;
-  stroke-width: 1.5px;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  flex-shrink: 0;
 }
 
 .context-usage {
@@ -975,16 +968,6 @@ openclaw-pending-session-create {
   align-items: center;
   justify-content: space-between;
   gap: 20px;
-}
-
-.context-usage__title,
-.context-usage__section-label {
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  line-height: 1.2;
-  text-transform: uppercase;
 }
 
 .context-usage__context-value {
@@ -1805,7 +1788,6 @@ openclaw-chat-video-player {
   min-width: 0;
   margin: 0;
   border: 1px solid var(--border);
-  background: var(--task-suggestion-card-bg);
   color: var(--text);
   font: 11px/1.4 var(--mono);
   white-space: pre-wrap;
@@ -2084,13 +2066,6 @@ openclaw-chat-video-player {
   color: var(--danger);
 }
 
-.chat-swarm__task-name {
-  overflow: hidden;
-  color: var(--text);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .chat-swarm__task-duration {
   font-variant-numeric: tabular-nums;
 }
@@ -2156,24 +2131,26 @@ openclaw-chat-video-player {
   color: var(--ok);
 }
 
-.chat-pr[data-state="draft"] .chat-pr__icon {
-  color: var(--muted);
-}
-
-.chat-pr[data-state="closed"] .chat-pr__icon {
-  color: var(--danger);
-}
-
-.chat-pr[data-state="merged"] .chat-pr__icon {
-  color: var(--pr-merged);
-}
-
+.chat-pr[data-state="draft"] .chat-pr__icon,
 .chat-pr[data-state="branch"] .chat-pr__icon {
   color: var(--muted);
 }
 
+.chat-pr[data-state="closed"] .chat-pr__icon,
+.chat-pr__deletions,
+.chat-pr__checks[data-checks="failing"],
+.chat-ci__status[data-state="failed"] {
+  color: var(--danger);
+}
+
+.chat-pr[data-state="merged"] .chat-pr__icon,
+.chat-pr[data-state="merged"] .chat-pr__state {
+  color: var(--pr-merged);
+}
+
 .chat-pr__number {
   min-width: 0;
+  overflow-wrap: anywhere;
   font-weight: 650;
 }
 
@@ -2227,28 +2204,20 @@ button.chat-pr__diff {
   cursor: var(--cursor-action);
 }
 
-.chat-pr__additions {
+.chat-pr__additions,
+.chat-pr__checks[data-checks="passing"],
+.chat-ci__status[data-state="passed"] {
   color: var(--ok);
-}
-
-.chat-pr__deletions {
-  color: var(--danger);
 }
 
 .chat-pr__checks {
   color: var(--muted);
 }
 
-.chat-pr__checks[data-checks="passing"] {
-  color: var(--ok);
-}
-
-.chat-pr__checks[data-checks="pending"] {
+.chat-pr__checks[data-checks="pending"],
+.chat-ci__status[data-state="running"],
+.chat-ci__status[data-state="queued"] {
   color: var(--warn);
-}
-
-.chat-pr__checks[data-checks="failing"] {
-  color: var(--danger);
 }
 
 .chat-pr__checks-pill {
@@ -2554,19 +2523,6 @@ openclaw-chat-ci-details {
   white-space: nowrap;
 }
 
-.chat-ci__status[data-state="passed"] {
-  color: var(--ok);
-}
-
-.chat-ci__status[data-state="failed"] {
-  color: var(--danger);
-}
-
-.chat-ci__status[data-state="running"],
-.chat-ci__status[data-state="queued"] {
-  color: var(--warn);
-}
-
 .chat-ci__job[open] > summary .chat-ci__chevron,
 .chat-ci__skipped[open] > summary .chat-ci__chevron {
   transform: rotate(180deg);
@@ -2651,10 +2607,6 @@ openclaw-chat-ci-details {
 .chat-pr__state {
   color: var(--muted);
   font-weight: 600;
-}
-
-.chat-pr[data-state="merged"] .chat-pr__state {
-  color: var(--pr-merged);
 }
 
 .chat-pr__warning {
@@ -2827,6 +2779,10 @@ openclaw-chat-ci-details {
   margin: 0 10px 10px;
 }
 
+.shell:not(.shell--mobile-nav) .chat-session-rail__composer.agent-chat__input {
+  margin-bottom: 20px;
+}
+
 /* One control in this row, so it keeps only the inset that stops the send from
    touching the frame. The shared bottom margin is sized for a row of chips. */
 .chat-session-rail__composer.agent-chat__input .agent-chat__composer-footer {
@@ -2938,6 +2894,21 @@ openclaw-chat-ci-details {
 
 .agent-chat__disabled-banner--compact .callout__content {
   min-width: 0;
+}
+
+/* Keep the desktop Subagents Stop appearance at the notice's button size. */
+.agent-chat__disabled-banner .agent-chat__disabled-banner-stop.btn {
+  border-color: transparent;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--danger) 9%, transparent);
+  color: var(--danger);
+}
+
+.agent-chat__disabled-banner-stop.btn svg {
+  width: 10px;
+  height: 10px;
+  fill: currentColor;
+  stroke: none;
 }
 
 .agent-chat__disabled-banner-icon--eye {
@@ -3329,4 +3300,98 @@ openclaw-chat-ci-details {
 
 .chat-provider-review .chat-composer-neighbor-card__copy :is(strong, span) {
   white-space: normal;
+}
+
+.chat-pane__chat-toggle,
+.chat-pane__layout-trigger,
+.chat-pane__sharing-trigger,
+.chat-pane__subagents-running {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.chat-pane__chat-toggle,
+.chat-pane__layout-trigger,
+.chat-pane__sharing-trigger {
+  padding: 5px 8px;
+  line-height: 1;
+}
+
+@media (max-width: 768px), (max-width: 932px) and (max-height: 500px) and (orientation: landscape) {
+  .chat-pane__chat-toggle,
+  .chat-pane__layout-trigger {
+    min-height: 44px;
+  }
+
+  /* Keep the complete action list scrollable without covering the conversation. */
+  .chat-panel-layout-menu > .oc-menu {
+    --oc-overlay-max-height: min(360px, 50dvh);
+
+    width: min(264px, calc(100dvw - 24px));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  .chat-panel-layout-menu .session-menu__item {
+    min-height: 44px;
+  }
+
+  .chat-panel-layout-menu .session-menu__text {
+    display: block;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  /* The desktop shortcut rail consumes label space but offers no touch action. */
+  .chat-panel-layout-menu .side-panel-type-option__shortcut,
+  .chat-panel-layout-menu .session-menu__item > .oc-menu-item__details {
+    display: none;
+  }
+}
+
+.chat-pane__chat-toggle svg,
+.chat-pane__layout-trigger svg,
+.chat-pane__sharing-trigger svg,
+.chat-pane__subagents-running svg {
+  width: 16px;
+  height: 16px;
+  stroke-width: 1.6px;
+}
+
+.chat-pane__header--stacked-status {
+  flex-wrap: wrap;
+  row-gap: 0;
+}
+
+.chat-pane__header--stacked-status > .chat-pane__header-leading {
+  flex: 1;
+}
+
+.chat-pane__header--stacked-status > .chat-pane__subagents-running {
+  flex-basis: 100%;
+  padding-bottom: 6px;
+}
+
+.chat-pr__accounts-panel .oc-menu-item__check {
+  display: none;
+}
+
+.chat-pr__checks-overlay {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+}
+
+.chat-pane__chat-toggle {
+  order: 1;
+}
+
+.chat-pane__chat-toggle[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--bg-hover);
 }

@@ -31,7 +31,6 @@ type SessionUsageUpdateParams = {
   contextTokensSource?: SessionEntry["contextTokensSource"];
   contextBudgetStatus?: SessionEntry["contextBudgetStatus"];
   promptTokens?: number;
-  isHeartbeat?: boolean;
   systemPromptReport?: SessionSystemPromptReport;
   /** Presence overrides usage inference; undefined tokens explicitly mean current context is unknown. */
   currentContextSnapshot?: { tokens: number | undefined };
@@ -50,7 +49,7 @@ export function prepareSessionUsageUpdate(params: SessionUsageUpdateParams) {
   const hasUsage = hasNonzeroUsage(params.usage);
   const hasBilling = hasBillableUsage(params.usage);
   const hasPromptTokens =
-    typeof params.promptTokens === "number" &&
+    params.promptTokens !== undefined &&
     Number.isFinite(params.promptTokens) &&
     params.promptTokens > 0;
   const hasUsableLastCallUsage =
@@ -60,6 +59,7 @@ export function prepareSessionUsageUpdate(params: SessionUsageUpdateParams) {
 
   // A monetary-only update must not invalidate the existing context observation.
   const hasContextUpdate =
+    params.usage?.usageReport?.state === "unavailable" ||
     hasUsage ||
     hasFreshContextSnapshot ||
     hasCurrentContextSnapshot ||
@@ -79,15 +79,10 @@ export function prepareSessionUsageUpdate(params: SessionUsageUpdateParams) {
     systemPromptReport: params.systemPromptReport,
     promptTokens: params.promptTokens,
     currentContextTokens: resolveNonNegativeTokenCount(params.currentContextSnapshot?.tokens),
-    hasUsage,
-    hasBilling,
     hasContextUpdate,
     hasFreshContextSnapshot,
     hasCurrentContextSnapshot,
-    preserveSessionModelState:
-      params.isHeartbeat === true ||
-      params.preserveRuntimeModel === true ||
-      preserveUserFacingRunState,
+    preserveSessionModelState: params.preserveRuntimeModel === true || preserveUserFacingRunState,
     preserveUserFacingRunState,
     preserveFreshTotalTokensOnStaleUsage: params.preserveFreshTotalTokensOnStaleUsage,
   };

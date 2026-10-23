@@ -86,8 +86,9 @@ async function promptMSTeamsAllowFrom(params: {
       entries: parts,
     }).catch(() => null);
 
+    let ids: string[];
     if (!resolved) {
-      const ids = parts.filter((part) => looksLikeGuid(part));
+      ids = parts.filter((part) => looksLikeGuid(part));
       if (ids.length !== parts.length) {
         await params.prompter.note(
           t("wizard.msteams.graphLookupUnavailable"),
@@ -95,27 +96,19 @@ async function promptMSTeamsAllowFrom(params: {
         );
         continue;
       }
-      const unique = mergeAllowFromEntries(existing, ids);
-      return patchMSTeamsAccountConfig({
-        cfg: params.cfg,
-        accountId,
-        patch: { dmPolicy: "allowlist", allowFrom: unique },
-        scopeDefaultToAccounts: shouldScopeMSTeamsDefaultToAccounts(params.cfg, accountId),
-      });
+    } else {
+      const unresolved = resolved.filter((item) => !item.resolved || !item.id);
+      if (unresolved.length > 0) {
+        await params.prompter.note(
+          t("wizard.msteams.couldNotResolve", {
+            entries: unresolved.map((item) => item.input).join(", "),
+          }),
+          t("wizard.msteams.allowlistTitle"),
+        );
+        continue;
+      }
+      ids = resolved.flatMap((item) => (item.id ? [item.id] : []));
     }
-
-    const unresolved = resolved.filter((item) => !item.resolved || !item.id);
-    if (unresolved.length > 0) {
-      await params.prompter.note(
-        t("wizard.msteams.couldNotResolve", {
-          entries: unresolved.map((item) => item.input).join(", "),
-        }),
-        t("wizard.msteams.allowlistTitle"),
-      );
-      continue;
-    }
-
-    const ids = resolved.flatMap((item) => (item.id ? [item.id] : []));
     const unique = mergeAllowFromEntries(existing, ids);
     return patchMSTeamsAccountConfig({
       cfg: params.cfg,
@@ -131,48 +124,6 @@ function shouldScopeMSTeamsDefaultToAccounts(cfg: OpenClawConfig, accountId: str
     return false;
   }
   return Object.keys(cfg.channels?.msteams?.accounts ?? {}).length > 0;
-}
-
-function setMSTeamsTeamsAllowlist(
-  cfg: OpenClawConfig,
-  accountId: string,
-  entries: Array<{ teamKey: string; channelKey?: string }>,
-): OpenClawConfig {
-  const baseTeams = resolveMSTeamsAccountConfig(cfg, accountId).teams ?? {};
-  const teams: Record<string, MSTeamsTeamConfig> = { ...baseTeams };
-  for (const entry of entries) {
-    const teamKey = entry.teamKey;
-    if (!teamKey) {
-      continue;
-    }
-    const existing = teams[teamKey] ?? {};
-    if (entry.channelKey) {
-      const channels = { ...existing.channels };
-      channels[entry.channelKey] = channels[entry.channelKey] ?? {};
-      teams[teamKey] = { ...existing, channels };
-    } else {
-      teams[teamKey] = existing;
-    }
-  }
-  return patchMSTeamsAccountConfig({
-    cfg,
-    accountId,
-    patch: { teams },
-    scopeDefaultToAccounts: shouldScopeMSTeamsDefaultToAccounts(cfg, accountId),
-  });
-}
-
-function listMSTeamsGroupEntries(cfg: OpenClawConfig, accountId: string): string[] {
-  return Object.entries(resolveMSTeamsAccountConfig(cfg, accountId).teams ?? {}).flatMap(
-    ([teamKey, value]) => {
-      const channels = value?.channels ?? {};
-      const channelKeys = Object.keys(channels);
-      if (channelKeys.length === 0) {
-        return [teamKey];
-      }
-      return channelKeys.map((channelKey) => `${teamKey}/${channelKey}`);
-    },
-  );
 }
 
 async function resolveMSTeamsGroupAllowlist(params: {
@@ -199,40 +150,32 @@ async function resolveMSTeamsGroupAllowlist(params: {
       accountId: params.accountId,
       entries: params.entries,
     });
-    const resolvedChannels = lookups.filter(
-      (entry) => entry.resolved && entry.teamId && entry.channelId,
+    const resolvedChannels = lookups.flatMap((entry) =>
+      entry.resolved && entry.teamId && entry.channelId
+        ? [{ teamKey: entry.teamId, channelKey: entry.channelId }]
+        : [],
     );
-    const resolvedTeams = lookups.filter(
-      (entry) => entry.resolved && entry.teamId && !entry.channelId,
+    const resolvedTeams = lookups.flatMap((entry) =>
+      entry.resolved && entry.teamId && !entry.channelId ? [{ teamKey: entry.teamId }] : [],
     );
     const unresolved = lookups.filter((entry) => !entry.resolved).map((entry) => entry.input);
     resolvedEntries = [
-      ...resolvedChannels.flatMap((entry) =>
-        entry.teamId && entry.channelId
-          ? [{ teamKey: entry.teamId, channelKey: entry.channelId }]
-          : [],
-      ),
-      ...resolvedTeams.flatMap((entry) => (entry.teamId ? [{ teamKey: entry.teamId }] : [])),
+      ...resolvedChannels,
+      ...resolvedTeams,
       ...unresolved.map((entry) => parseMSTeamsTeamEntry(entry)).filter((entry) => entry !== null),
     ];
     const summary: string[] = [];
     if (resolvedChannels.length > 0) {
       summary.push(
         t("wizard.msteams.resolvedChannels", {
-          entries: resolvedChannels
-            .map((entry) => entry.channelId)
-            .filter(Boolean)
-            .join(", "),
+          entries: resolvedChannels.map((entry) => entry.channelKey).join(", "),
         }),
       );
     }
     if (resolvedTeams.length > 0) {
       summary.push(
         t("wizard.msteams.resolvedTeams", {
-          entries: resolvedTeams
-            .map((entry) => entry.teamId)
-            .filter(Boolean)
-            .join(", "),
+          entries: resolvedTeams.map((entry) => entry.teamKey).join(", "),
         }),
       );
     }
@@ -258,14 +201,43 @@ const msteamsGroupAccessBase = createAccountScopedGroupAccessSection({
   placeholder: "Team Name/Channel Name, teamId/conversationId",
   currentPolicy: ({ cfg, accountId }) =>
     resolveMSTeamsAccountConfig(cfg, accountId).groupPolicy ?? "allowlist",
-  currentEntries: ({ cfg, accountId }) => listMSTeamsGroupEntries(cfg, accountId),
+  currentEntries: ({ cfg, accountId }) =>
+    Object.entries(resolveMSTeamsAccountConfig(cfg, accountId).teams ?? {}).flatMap(
+      ([teamKey, value]) => {
+        const channels = value?.channels ?? {};
+        const channelKeys = Object.keys(channels);
+        if (channelKeys.length === 0) {
+          return [teamKey];
+        }
+        return channelKeys.map((channelKey) => `${teamKey}/${channelKey}`);
+      },
+    ),
   updatePrompt: ({ cfg, accountId }) => Boolean(resolveMSTeamsAccountConfig(cfg, accountId).teams),
   resolveAllowlist: ({ cfg, accountId, entries, prompter }) =>
     resolveMSTeamsGroupAllowlist({ cfg, accountId, entries, prompter }),
   fallbackResolved: (entries) =>
     entries.map((entry) => parseMSTeamsTeamEntry(entry)).filter((entry) => entry !== null),
-  applyAllowlist: ({ cfg, accountId, resolved }) =>
-    setMSTeamsTeamsAllowlist(cfg, accountId, resolved),
+  applyAllowlist: ({ cfg, accountId, resolved: entries }) => {
+    const baseTeams = resolveMSTeamsAccountConfig(cfg, accountId).teams ?? {};
+    const teams: Record<string, MSTeamsTeamConfig> = { ...baseTeams };
+    for (const entry of entries) {
+      const teamKey = entry.teamKey;
+      const existing = teams[teamKey] ?? {};
+      if (entry.channelKey) {
+        const channels = { ...existing.channels };
+        channels[entry.channelKey] = channels[entry.channelKey] ?? {};
+        teams[teamKey] = { ...existing, channels };
+      } else {
+        teams[teamKey] = existing;
+      }
+    }
+    return patchMSTeamsAccountConfig({
+      cfg,
+      accountId,
+      patch: { teams },
+      scopeDefaultToAccounts: shouldScopeMSTeamsDefaultToAccounts(cfg, accountId),
+    });
+  },
 });
 
 const msteamsGroupAccess: NonNullable<ChannelSetupWizard["groupAccess"]> = {
@@ -317,13 +289,9 @@ const msteamsSetupWizardBase = createMSTeamsSetupWizardBase();
 export const msteamsSetupWizard: ChannelSetupWizard = {
   ...msteamsSetupWizardBase,
   finalize: async (params) => {
-    const baseFinalize = msteamsSetupWizardBase.finalize;
-    const baseResult = baseFinalize ? await baseFinalize(params) : undefined;
-    let next = baseResult?.cfg ?? params.cfg;
-    const resolvedAccountId =
-      baseResult && "accountId" in baseResult && typeof baseResult.accountId === "string"
-        ? baseResult.accountId
-        : params.accountId;
+    const baseResult = await msteamsSetupWizardBase.finalize(params);
+    let next = baseResult.cfg;
+    const resolvedAccountId = baseResult.accountId;
     const finalCreds = resolveMSTeamsCredentials(
       resolveMSTeamsAccountConfig(next, resolvedAccountId),
       {

@@ -11,6 +11,7 @@ import { SessionTranscriptWriterClaimReboundError } from "../../config/sessions/
 import {
   hasSqliteWorkerOutcomeUnknown,
   SqliteWorkerError,
+  wrapSqliteWorkerError,
 } from "../../infra/sqlite-worker-contract.js";
 import { recordModelFallbackStop } from "../model-fallback-stop.js";
 import { captureSessionMessageAdmission } from "./session-manager-message-admission.js";
@@ -57,16 +58,9 @@ export async function appendSessionManagerActor(input: {
     },
   };
   assertCurrent();
-  const snapshot = actor.snapshot(authority);
   let captured: CommittedAppend | undefined;
   let outcome: SessionActorOutcome<AppendValue>;
   try {
-    const command = {
-      commandId: randomUUID(),
-      phaseId: "session-manager.append",
-      expected: snapshot?.version,
-      append,
-    };
     const observer = {
       committed: (value: CommittedAppend) => {
         captured = value;
@@ -75,17 +69,12 @@ export async function appendSessionManagerActor(input: {
         }
       },
     };
-    const execute = () =>
-      input.toolResult
-        ? actor.appendToolResult(command, authority, observer)
-        : actor.appendTranscriptEvent(command, authority, observer);
-    outcome = await execute();
-    // The typed stale reply proves no mutation ran; a captured commit always wins.
-    if (outcome.kind === "stale-version" && !captured) {
-      assertCurrent();
-      command.expected = outcome.postimage.version;
-      outcome = await execute();
-    }
+    // The worker selects the current actor version under its writer FIFO;
+    // the prepared append carries its own transcript and live-authority predicates.
+    const command = { commandId: randomUUID(), phaseId: "session-manager.append", append };
+    outcome = input.toolResult
+      ? await actor.appendToolResult(command, authority, observer)
+      : await actor.appendTranscriptEvent(command, authority, observer);
   } catch (cause) {
     if (!captured) {
       if (hasSqliteWorkerOutcomeUnknown(cause)) {
@@ -104,7 +93,7 @@ export async function appendSessionManagerActor(input: {
     return finish(captured, new Error("Session actor reply contradicted its captured commit"));
   }
   if (outcome.kind === "unknown") {
-    const error = new SqliteWorkerError(outcome.error.message, "outcome-unknown");
+    const error = wrapSqliteWorkerError(outcome.error.message, "outcome-unknown", outcome.error);
     recordModelFallbackStop(error);
     throw error;
   }

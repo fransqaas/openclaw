@@ -22,18 +22,17 @@ import {
   serializeModelCatalogBundle,
   summarizeModelCatalogBundle,
 } from "../../scripts/publish-model-catalog.mts";
+import { MODELS_JSON_STATE } from "../../src/agents/models-config-state.js";
 import type { OpenClawConfig } from "../../src/config/types.openclaw.js";
+import { prepareRemoteModelCatalogStartupSnapshot } from "../../src/model-catalog/remote-overlay.js";
 import { setRemoteModelCatalogOverlaySourcesForTest } from "../../src/model-catalog/remote-overlay.test-support.js";
-import {
-  resetUsageFormatCachesForTest,
-  resolveModelCostConfig,
-} from "../../src/utils/usage-format.js";
+import { resolveModelCostConfig } from "../../src/utils/usage-format.js";
 
 const tempDirs: string[] = [];
 
 afterEach(() => {
   setRemoteModelCatalogOverlaySourcesForTest();
-  resetUsageFormatCachesForTest();
+  MODELS_JSON_STATE.costCache.clear();
   vi.unstubAllEnvs();
   for (const dir of tempDirs.splice(0)) {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -79,7 +78,7 @@ function modelsDevCatalog(
   );
 }
 
-function publishedPricingParams(bundle: RemoteModelCatalogBundle, provider: string) {
+async function publishedPricingParams(bundle: RemoteModelCatalogBundle, provider: string) {
   const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-native-pricing-"));
   tempDirs.push(agentDir);
   vi.stubEnv("OPENCLAW_STATE_DIR", agentDir);
@@ -101,6 +100,7 @@ function publishedPricingParams(bundle: RemoteModelCatalogBundle, provider: stri
     models: { catalogRefresh: { url: "https://catalog.openclaw.ai/models/v1/catalog.json" } },
     plugins: { allow: [provider], entries: { [provider]: { enabled: true } } },
   };
+  await prepareRemoteModelCatalogStartupSnapshot();
   return { config, agentDir, provider };
 }
 
@@ -251,7 +251,7 @@ describe("publish model catalog", () => {
     expect(bundle.pricing).not.toHaveProperty("absent");
     expect(bundle.pricing).not.toHaveProperty("foreign/hidden");
     expect(bundle.providers).not.toHaveProperty("foreign");
-    const params = publishedPricingParams(bundle, "deepinfra");
+    const params = await publishedPricingParams(bundle, "deepinfra");
     for (const model of ["free", "standalone-free"]) {
       expect(bundle.pricing?.[`deepinfra/${model}`]).toEqual({ input: 0, output: 0 });
       expect(resolveModelCostConfig({ ...params, model })).toEqual({
@@ -359,6 +359,39 @@ describe("publish model catalog", () => {
         sourceCommit: "fixture-sha",
       }),
     ).rejects.toThrow();
+  });
+
+  it("hydrates a runtime-discovered provider that declares no static rows", async () => {
+    const manifests = [
+      {
+        pluginId: "fixture",
+        manifestPath: "fixture.json",
+        manifest: {
+          providers: ["anthropic", "openai", "gateway"],
+          modelCatalog: {
+            providers: {
+              anthropic: fixtureProvider("claude", 100),
+              openai: fixtureProvider("gpt", 100),
+              gateway: { api: "anthropic-messages", models: [] },
+            },
+            modelsDev: { gateway: "upstream-gateway" },
+          },
+        },
+      },
+    ];
+    const bundle = await assembleFixtureBundle(manifests);
+    expect(bundle.providers.gateway).toBeUndefined();
+    const fetchImpl = vi.fn<typeof fetch>(async () =>
+      Response.json(modelsDevCatalog({ "upstream-gateway": [modelsDevModel("vendor/model")] })),
+    );
+
+    await expect(
+      hydrateModelCatalogFromModelsDev({ bundle, manifests, fetchImpl }),
+    ).resolves.toEqual({ gateway: { added: 1, filled: 0, skipped: 0 } });
+    expect(bundle.providers.gateway).toMatchObject({
+      api: "anthropic-messages",
+      models: [{ id: "vendor/model" }],
+    });
   });
 
   it("hydrates missing models and fills only undefined manifest metadata", async () => {
@@ -1246,7 +1279,7 @@ describe("publish model catalog", () => {
         );
         expect(
           resolveModelCostConfig({
-            ...publishedPricingParams(bundle, provider),
+            ...(await publishedPricingParams(bundle, provider)),
             model: "priced-fixture",
           }),
         ).toBeUndefined();

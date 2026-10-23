@@ -3,6 +3,8 @@ import type { SessionEntry } from "./types.js";
 /** Identity is parser-validated; optional owner values retain their exact stored semantics. */
 export type SessionEntryCurrentFacts = {
   sessionId: string;
+  createdVia?: unknown;
+  createdActor?: SessionEntry["createdActor"];
   incognito?: SessionEntry["incognito"];
   modelSelectionLocked?: SessionEntry["modelSelectionLocked"];
   pluginOwnerId?: SessionEntry["pluginOwnerId"];
@@ -11,9 +13,11 @@ export type SessionEntryCurrentFacts = {
   initializationPending?: SessionEntry["initializationPending"];
   execHost?: SessionEntry["execHost"];
   execNode?: SessionEntry["execNode"];
+  deviceFolder?: SessionEntry["deviceFolder"];
   sandbox?: SessionEntry["sandbox"];
   sandboxMode?: SessionEntry["sandboxMode"];
   permissionMode?: SessionEntry["permissionMode"];
+  toolOverrides?: SessionEntry["toolOverrides"];
   sessionRoot?: SessionEntry["sessionRoot"];
   authProfileOverride?: SessionEntry["authProfileOverride"];
   authProfileOverrideSource?: SessionEntry["authProfileOverrideSource"];
@@ -37,6 +41,8 @@ export type SessionEntryCurrentFacts = {
   inheritedToolAllow?: unknown;
   inheritedToolDeny?: unknown;
   delegatedToolPolicy?: unknown;
+  skillLibrarySelections?: unknown;
+  executionPolicy?: unknown;
   subagentRecovery?: {
     lastRunId?: unknown;
     sessionLifecycleRunId?: unknown;

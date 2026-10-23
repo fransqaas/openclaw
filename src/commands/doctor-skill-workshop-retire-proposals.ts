@@ -7,12 +7,15 @@ import { resolveCanonicalWorkspacePath } from "../agents/workspace-state-identit
 import { resolveStateDir } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { sha256Hex } from "../infra/crypto-digest.js";
+import { requireNativeDatabaseFile } from "../infra/database-engine/physical-facts.js";
 import { isMissingPathError } from "../infra/errors.js";
 import { pathExists, root } from "../infra/fs-safe.js";
 import { acquireGatewayLock } from "../infra/gateway-lock.js";
 import { isPathInside } from "../infra/path-guards.js";
+import { isPostgresSqlConnection } from "../infra/sql-connection.js";
 import type { MigrationMessages } from "../infra/state-migrations.types.js";
 import { isUpdateRehearsalReadOnlyPath } from "../infra/update-rehearsal-paths.js";
+import { decodeUtf8Input } from "../infra/utf8-input.js";
 import { normalizeAgentId, parseAgentSessionKey } from "../routing/session-key.js";
 import {
   prepareWorkspaceSkillRestoration,
@@ -295,7 +298,9 @@ async function appendLegacyJsonProposals(params: {
         ...readOptions,
         maxBytes: MAX_EXPORT_FILE_BYTES,
       });
-      const record: unknown = JSON.parse(read.buffer.toString("utf8"));
+      const record: unknown = JSON.parse(
+        decodeUtf8Input(read.buffer, `Skill Workshop proposal ${entry.name}`),
+      );
       if (!isRecord(record) || typeof record.status !== "string") {
         throw new Error("proposal record has no status");
       }
@@ -312,7 +317,9 @@ async function appendLegacyJsonProposals(params: {
             throw error;
           });
         if (rollback) {
-          const facts: unknown = JSON.parse(rollback.buffer.toString("utf8"));
+          const facts: unknown = JSON.parse(
+            decodeUtf8Input(rollback.buffer, `Skill Workshop rollback ${entry.name}`),
+          );
           if (!isRecord(facts)) {
             throw new Error("rollback is not an object");
           }
@@ -544,6 +551,9 @@ async function retireProposals(params: {
   assertCurrent();
   const dropped = runOpenClawStateWriteTransaction(
     ({ db }) => {
+      if (isPostgresSqlConnection(db)) {
+        requireNativeDatabaseFile("postgres", "repair");
+      }
       assertCurrent();
       // Reread inside the transaction: a proposal written since planning keeps the tables.
       const pending = tableExists(db, "skill_workshop_proposals")

@@ -3,6 +3,7 @@ import { registerSessionOrganizationEnglish } from "../i18n/locales/en-session-o
 import { formatUiError } from "../lib/format-error.ts";
 import { resolveSessionDisplayName } from "../lib/session-display.ts";
 import { fetchChildSessionRows } from "../lib/sessions/child-session-data.ts";
+import { customSnoozeStorageKey, rememberCustomSnooze } from "../lib/sessions/custom-snooze.ts";
 import { collectSessionArchiveTree } from "../lib/sessions/session-archive-tree.ts";
 import { resolveUiSessionRowAgentId, isSubagentSessionKey } from "../lib/sessions/session-key.ts";
 import { formatSessionSnoozeWakeTime } from "../lib/sessions/session-snooze.ts";
@@ -11,7 +12,7 @@ import type {
   SidebarSessionMutationResult,
   SidebarSessionMutationScope,
 } from "./app-sidebar-session-types.ts";
-import { showConfirmDialog } from "./confirm-dialog.ts";
+import { showConfirmChoiceDialog, showConfirmDialog } from "./confirm-dialog.ts";
 import {
   patchSessionRows,
   type SessionActionHost,
@@ -24,12 +25,19 @@ registerSessionOrganizationEnglish();
 export async function snoozeSessionWithUndo(
   host: SessionActionHost,
   session: SessionActionRow,
-  snoozedUntil: number,
+  choice: { snoozedUntil: number; rememberCustom?: boolean },
   scope: SidebarSessionMutationScope,
 ) {
+  const { snoozedUntil, rememberCustom } = choice;
   const result = await patchSession(host, session, { snoozedUntil }, scope, { sessionScope: true });
   if (result !== "completed" || !host.sessionData.isSessionMutationScopeCurrent(scope)) {
     return;
+  }
+  if (rememberCustom) {
+    rememberCustomSnooze(
+      customSnoozeStorageKey(scope.client.gatewayUrl, scope.client.recoveryScope),
+      snoozedUntil,
+    );
   }
   const undoHost = sessionUndoHost(host, scope);
   showToast({
@@ -53,16 +61,16 @@ export async function promoteSession(
   }
 }
 
-export async function archiveSessionTreeWithUndo(
-  host: SessionActionHost,
+/** Discover descendants only for hinted parents; leaf archives keep their existing fast path. */
+export async function confirmSessionArchive(
   session: SessionActionRow,
   scope: SidebarSessionMutationScope,
-) {
-  const isCurrent = () => host.sessionData.isSessionMutationScopeCurrent(scope);
+  isCurrent: () => boolean,
+): Promise<{ kind: "single" } | { kind: "tree"; rows: SessionActionRow[] } | null> {
   if (!isCurrent()) {
-    return;
+    return null;
   }
-  try {
+  if (session.hasArchiveDescendants) {
     const { session: root } = await scope.sessions.describe(
       {
         key: session.key,
@@ -71,7 +79,7 @@ export async function archiveSessionTreeWithUndo(
       { refresh: true },
     );
     if (!isCurrent()) {
-      return;
+      return null;
     }
     if (!root || !root.sessionId || root.sessionId !== session.sessionId || root.archived) {
       throw new Error(t("sessionsView.archiveTreeChanged"));
@@ -86,29 +94,15 @@ export async function archiveSessionTreeWithUndo(
         fetchChildSessionRows({ sessions: scope.sessions, parentKey, isCurrent }),
     });
     if (!tree || !isCurrent()) {
-      return;
+      return null;
     }
     const { rows, ancestorsByKey } = tree;
     if (rows.some((row) => !row.sessionId)) {
       throw new Error(t("sessionsView.archiveTreeChanged"));
     }
-    const hasActiveWork = rows.some((row) => row.hasActiveRun || row.hasActiveSubagentRun);
-    const confirmed = await showConfirmDialog({
-      message:
-        t("sessionsView.archiveSessionTreeConfirm", {
-          count: String(rows.length),
-          session: session.label,
-        }) + (hasActiveWork ? "\n\n" + t("sessionsView.archiveRunningSessions") : ""),
-      confirmLabel: t("sessionsView.archiveSessionCount", { count: String(rows.length) }),
-      signal: scope.signal,
-    });
-    if (!isCurrent() || !confirmed) {
-      return;
-    }
-    await archiveSessionsWithUndo(
-      host,
+    if (rows.length > 1) {
       // Descendants settle before their ancestors, which must remain unarchived.
-      rows.toReversed().map((row) => ({
+      const guardedRows: SessionActionRow[] = rows.toReversed().map((row) => ({
         key: row.key,
         agentId: row.agentId,
         sessionId: row.sessionId,
@@ -135,29 +129,65 @@ export async function archiveSessionTreeWithUndo(
             };
           }),
         },
-      })),
-      scope,
-    );
-  } catch (error) {
-    if (isCurrent()) {
-      host.sessionData.publishSessionMutationError(scope, error);
+      }));
+      // Only direct children move to the top level; deeper sessions stay under them.
+      const directChildCount = rows.filter(
+        (row) => ancestorsByKey.get(row.key)?.length === 1,
+      ).length;
+      const choice = await showConfirmChoiceDialog({
+        title: t("sessionsView.archiveSessionTitle"),
+        message:
+          t(
+            directChildCount === 1
+              ? "sessionsView.archiveSessionNestedOne"
+              : "sessionsView.archiveSessionNestedOther",
+            { count: String(directChildCount), session: session.label },
+          ) +
+          (rows.some(hasActiveArchiveWork)
+            ? "\n\n" + t("sessionsView.archiveRunningSessions")
+            : ""),
+        confirmLabel: t("sessionsView.archiveAllSessions", { count: String(rows.length) }),
+        alternativeLabel: t("sessionsView.archiveThisSession"),
+        groupChoicesOnMobile: true,
+        signal: scope.signal,
+      });
+      if (!isCurrent() || choice === null) {
+        return null;
+      }
+      return choice === "confirm" ? { kind: "tree", rows: guardedRows } : { kind: "single" };
     }
   }
+  return (await confirmRunningSessionsArchive([session], scope.signal)) && isCurrent()
+    ? { kind: "single" }
+    : null;
 }
 
-export async function confirmRunningSessionArchive(
-  session: Pick<
-    SessionActionRow,
-    "label" | "hasActiveRun" | "gatewayHasActiveRun" | "hasActiveSubagentRun"
-  >,
+type SessionArchiveActivity = Pick<
+  SessionActionRow,
+  "hasActiveRun" | "gatewayHasActiveRun" | "hasActiveSubagentRun"
+>;
+
+function hasActiveArchiveWork(session: SessionArchiveActivity): boolean {
+  return Boolean(
+    (session.gatewayHasActiveRun ?? session.hasActiveRun) || session.hasActiveSubagentRun,
+  );
+}
+
+export async function confirmRunningSessionsArchive(
+  sessions: readonly (SessionArchiveActivity & Pick<SessionActionRow, "label">)[],
   signal?: AbortSignal,
 ): Promise<boolean> {
-  if (!(session.gatewayHasActiveRun ?? session.hasActiveRun) && !session.hasActiveSubagentRun) {
+  if (!sessions.some(hasActiveArchiveWork)) {
     return true;
   }
+  const single = sessions.length === 1 ? sessions[0] : undefined;
   return showConfirmDialog({
-    message: t("sessionsView.archiveRunningSessionConfirm", { session: session.label }),
-    confirmLabel: t("sessionsView.archiveSession"),
+    message: single
+      ? t("sessionsView.archiveRunningSessionConfirm", { session: single.label })
+      : t("sessionsView.archiveRunningSessions"),
+    confirmLabel: single
+      ? t("sessionsView.archiveSession")
+      : t("sessionsView.archiveSessionCount", { count: String(sessions.length) }),
     signal,
   });
 }
@@ -170,10 +200,22 @@ export async function archiveSessionWithUndo(
   if (!host.sessionData.isSessionMutationScopeCurrent(scope)) {
     return;
   }
-  if (
-    !(await confirmRunningSessionArchive(session, scope.signal)) ||
-    !host.sessionData.isSessionMutationScopeCurrent(scope)
-  ) {
+  let choice: Awaited<ReturnType<typeof confirmSessionArchive>>;
+  try {
+    choice = await confirmSessionArchive(session, scope, () =>
+      host.sessionData.isSessionMutationScopeCurrent(scope),
+    );
+  } catch (error) {
+    if (host.sessionData.isSessionMutationScopeCurrent(scope)) {
+      host.sessionData.publishSessionMutationError(scope, error);
+    }
+    return;
+  }
+  if (!choice) {
+    return;
+  }
+  if (choice.kind === "tree") {
+    await archiveConfirmedSessionsWithUndo(host, choice.rows, scope);
     return;
   }
   const finishArchive = scope.sessions.beginArchive(session.key, session.sessionId);
@@ -201,6 +243,19 @@ export async function archiveSessionsWithUndo(
   rows: readonly SessionActionRow[],
   scope: SidebarSessionMutationScope,
 ) {
+  if (!host.sessionData.isSessionMutationScopeCurrent(scope)) {
+    return;
+  }
+  if (await confirmRunningSessionsArchive(rows, scope.signal)) {
+    await archiveConfirmedSessionsWithUndo(host, rows, scope);
+  }
+}
+
+export async function archiveConfirmedSessionsWithUndo(
+  host: SessionActionHost,
+  rows: readonly SessionActionRow[],
+  scope: SidebarSessionMutationScope,
+): Promise<"completed" | "stale" | { status: "failed"; error: unknown } | void> {
   if (rows.length === 0 || !host.sessionData.isSessionMutationScopeCurrent(scope)) {
     return;
   }
@@ -215,9 +270,20 @@ export async function archiveSessionsWithUndo(
     return;
   }
   const pendingRows = pending.map(({ row }) => row);
+  let failure: { status: "failed"; error: unknown } | undefined;
+  const initialHost: SessionActionHost = {
+    ...outcomeHost,
+    sessionData: {
+      ...outcomeHost.sessionData,
+      publishSessionMutationError: (candidate, error) => {
+        failure = { status: "failed", error };
+        outcomeHost.sessionData.publishSessionMutationError(candidate, error);
+      },
+    },
+  };
   let archivedRows: SessionActionRow[] | null;
   try {
-    archivedRows = await patchSessionRows(outcomeHost, pendingRows, { archived: true }, scope, {
+    archivedRows = await patchSessionRows(initialHost, pendingRows, { archived: true }, scope, {
       sessionScope: true,
     });
   } finally {
@@ -226,7 +292,7 @@ export async function archiveSessionsWithUndo(
     }
   }
   if (!archivedRows || archivedRows.length === 0) {
-    return;
+    return failure ?? "stale";
   }
   const archived = archivedRows.map((session) => ({ session, pinned: session.pinned }));
   showToast({
@@ -239,6 +305,7 @@ export async function archiveSessionsWithUndo(
     // Keep a partial-failure notice readable before presenting successful-only Undo.
     fifo: true,
   });
+  return failure ?? "completed";
 }
 
 function archiveUndoAction(

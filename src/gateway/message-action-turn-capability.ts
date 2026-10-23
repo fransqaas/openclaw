@@ -3,6 +3,10 @@ import { randomBytes } from "node:crypto";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { ScheduledToolPolicyContext } from "../agents/scheduled-tool-policy.js";
 import type { InternalChannelThreadingToolContext } from "../channels/threading-tool-context-internal.js";
+import {
+  composeSessionSourceAssertion,
+  type SessionSourceAssertion,
+} from "../config/sessions/session-source-authority.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { pruneMapToMaxSize } from "../infra/map-size.js";
 import { normalizeAgentId } from "../routing/session-key.js";
@@ -13,7 +17,6 @@ import {
   type UserTurnPromptReactionSource,
 } from "../sessions/user-turn-transcript-admission.js";
 import type { UserTurnTranscriptRecorder } from "../sessions/user-turn-transcript.types.js";
-import type { PreparedEffectUse } from "../shared/effect-authority.js";
 import {
   isDeliverableMessageChannel,
   normalizeMessageChannel,
@@ -29,16 +32,15 @@ const CAPABILITY_COMPLETION_GRACE_MS = 60_000;
 /** Host-only scheduled grant; never serialized or passed to channel plugins. */
 type ScheduledMessageActionAuthority = {
   policy: ScheduledToolPolicyContext;
-  assertCurrent: () => void;
-  assertSourceCurrent?: () => void;
-  prepareUse?: (sourceSensitive: boolean, assertCurrent?: () => void) => Promise<PreparedEffectUse>;
+  assertCurrent: SessionSourceAssertion;
+  assertSourceCurrent?: SessionSourceAssertion;
   channelRequester?: CronAuthenticatedChannelRequester;
 };
 
 /** Host-only delivery restriction; carries no channel, requester, or source privilege. */
 type MessageActionDeliveryAttempt = {
   beforeAttempt: () => Promise<void>;
-  assertCurrent: () => void;
+  assertCurrent: SessionSourceAssertion;
 };
 
 type PromptReactionBinding = {
@@ -53,6 +55,7 @@ export type DashboardMessageReadAdmission = Readonly<{
   runId: string;
   sessionKey: string;
   sessionId?: string;
+  prepare?: () => Promise<void>;
   assertCurrent: () => void;
 }>;
 
@@ -259,31 +262,24 @@ export function mintMessageActionTurnCapability(params: {
   const scheduled = params.scheduled;
   if (scheduled) {
     const assertSourceCurrent = scheduled.assertSourceCurrent;
-    const prepareUse = scheduled.prepareUse;
     capability.scheduled = {
       policy: structuredClone(scheduled.policy),
       ...(scheduled.channelRequester
         ? { channelRequester: structuredClone(scheduled.channelRequester) }
         : {}),
-      assertCurrent: () => {
+      assertCurrent: composeSessionSourceAssertion([scheduled.assertCurrent], (assertSource) => {
         assertActive();
-        scheduled.assertCurrent();
-      },
-      ...(prepareUse
-        ? {
-            prepareUse: (sourceSensitive: boolean, assertCurrent?: () => void) =>
-              prepareUse(sourceSensitive, () => {
-                assertActive();
-                assertCurrent?.();
-              }),
-          }
-        : {}),
+        assertSource();
+      }),
       ...(assertSourceCurrent
         ? {
-            assertSourceCurrent: () => {
-              assertActive();
-              assertSourceCurrent();
-            },
+            assertSourceCurrent: composeSessionSourceAssertion(
+              [assertSourceCurrent],
+              (assertSource) => {
+                assertActive();
+                assertSource();
+              },
+            ),
           }
         : {}),
     };
@@ -291,10 +287,13 @@ export function mintMessageActionTurnCapability(params: {
   const deliveryAttempt = params.deliveryAttempt;
   if (deliveryAttempt) {
     capability.deliveryAttempt = {
-      assertCurrent: () => {
-        assertActive();
-        deliveryAttempt.assertCurrent();
-      },
+      assertCurrent: composeSessionSourceAssertion(
+        [deliveryAttempt.assertCurrent],
+        (assertSource) => {
+          assertActive();
+          assertSource();
+        },
+      ),
       beforeAttempt: async () => {
         assertActive();
         deliveryAttempt.assertCurrent();

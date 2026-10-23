@@ -1,5 +1,8 @@
 import { Type } from "typebox";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
+import { configureAiTransportHost, getAiTransportHost } from "../../../../packages/ai/src/host.js";
+import { createOpenAICompletionsTransportStreamFn } from "../../../../packages/ai/src/transports/openai-completions-transport.js";
+import type { ContextEngine } from "../../../context-engine/types.js";
 import type { Context } from "../../../llm/types.js";
 import { createAssistantMessageEventStream } from "../../../llm/utils/event-stream.js";
 import { createDiagnosticEmbeddedRunOwner } from "../../../logging/diagnostic-run-activity.js";
@@ -11,6 +14,7 @@ import {
   registerAgentSessionLoopTestLifecycle,
   testModel,
 } from "../../sessions/agent-session-loop-correctness.test-support.js";
+import { SessionManager } from "../../sessions/session-manager.js";
 import { SettingsManager } from "../../sessions/settings-manager.js";
 import { makeZeroUsageSnapshot } from "../../usage.js";
 import { createToolResultPromptProjectionState } from "../session-prompt-state.js";
@@ -26,8 +30,50 @@ const { installEmbeddedAttemptStreamGuards } =
 
 registerAgentSessionLoopTestLifecycle();
 
-describe("mid-turn provider admission", () => {
+describe("provider request admission", () => {
   it.each([
+    {
+      name: "measured compatible reasoning output budget",
+      usage: 1_500,
+      chars: 15_500,
+      cap: 16_000,
+      fits: true,
+      compatibleBudget: true,
+    },
+    {
+      name: "unchanged response schema is not charged twice on a tool continuation",
+      usage: 24_000,
+      chars: 100,
+      cap: 16_000,
+      fits: true,
+      compatibleBudget: true,
+      responseSchema: true,
+    },
+    {
+      name: "owning engine cannot submit oversized assembled history on its first request",
+      usage: 15_000,
+      chars: 12_000,
+      cap: 16_000,
+      fits: false,
+      ownsCompaction: true,
+      oversizedAssembly: true,
+    },
+    {
+      name: "owning engine admits fitting requests despite an exaggerated engine estimate",
+      usage: 15_000,
+      chars: 12_000,
+      cap: 16_000,
+      fits: true,
+      ownsCompaction: true,
+    },
+    {
+      name: "owning engine blocks an oversized measured continuation without opt-in",
+      usage: 23_000,
+      chars: 12_000,
+      cap: 16_000,
+      fits: false,
+      ownsCompaction: true,
+    },
     { name: "measured unchanged prefix", usage: 15_000, chars: 12_000, cap: 16_000, fits: true },
     {
       name: "counts measured visible completion once",
@@ -37,6 +83,37 @@ describe("mid-turn provider admission", () => {
       fits: true,
       completionTokens: 6_000,
       assistantChars: 24_000,
+    },
+    {
+      name: "counts visible completion once after a small system change",
+      usage: 15_000,
+      chars: 2_000,
+      cap: 16_000,
+      fits: true,
+      completionTokens: 5_000,
+      assistantChars: 20_000,
+      tweakSystem: true,
+    },
+    {
+      name: "counts visible completion once after tool definitions change",
+      usage: 15_000,
+      chars: 2_000,
+      cap: 16_000,
+      fits: true,
+      completionTokens: 5_000,
+      assistantChars: 20_000,
+      tweakTools: true,
+    },
+    {
+      name: "counts split visible completion once after a small system change",
+      usage: 15_000,
+      chars: 2_000,
+      cap: 16_000,
+      fits: true,
+      completionTokens: 5_000,
+      assistantChars: 20_000,
+      asyncFragments: true,
+      tweakSystem: true,
     },
     {
       name: "counts async completion fragments once when the provider identity arrives late",
@@ -121,20 +198,56 @@ describe("mid-turn provider admission", () => {
       fits,
       growSystem,
       tweakSystem,
+      tweakTools,
       opaque,
       completionTokens,
       assistantChars,
       asyncFragments,
       syntheticAssistant,
+      ownsCompaction,
+      oversizedAssembly,
+      compatibleBudget,
+      responseSchema,
     }) => {
       const fixture = await createFixture({ exerciseTerminalMerges: false });
       const model = {
         ...testModel,
         api: opaque ? ("openai-responses" as const) : ("openai-completions" as const),
         contextWindow: 32_768,
-        maxTokens: 1_024,
+        maxTokens: compatibleBudget ? 8_192 : 1_024,
+        ...(compatibleBudget
+          ? {
+              provider: "reasoning-proof",
+              baseUrl: "http://127.0.0.1:19831/v1",
+              reasoning: true,
+              compat: { maxTokensField: "max_tokens" as const },
+            }
+          : {}),
       };
-      const systemPrompt = "Keep these instructions. ".repeat(2_200);
+      const systemPrompt = compatibleBudget
+        ? "Read the report."
+        : "Keep these instructions. ".repeat(2_200);
+      const reasoningHistory = "synthetic reasoning ".repeat(3_500);
+      const seededManager =
+        compatibleBudget && !responseSchema ? SessionManager.inMemory() : undefined;
+      if (seededManager) {
+        await seededManager.appendMessageAsync({
+          role: "user",
+          content: "Earlier question.",
+          timestamp: 1,
+        });
+        await seededManager.appendMessageAsync({
+          ...createAssistant(model, [
+            {
+              type: "thinking",
+              thinking: reasoningHistory,
+              thinkingSignature: "reasoning_content",
+            },
+            { type: "text", text: "Earlier answer." },
+          ]),
+          usage: makeZeroUsageSnapshot(),
+        });
+      }
       const requests: Context[] = [];
       const settingsManager = SettingsManager.inMemory({
         compaction: { enabled: false, reserveTokens: 8_192 },
@@ -143,6 +256,7 @@ describe("mid-turn provider admission", () => {
       const { session, sessionManager } = await createTestSession({
         model,
         systemPrompt,
+        ...(seededManager ? { sessionManager: seededManager } : {}),
         settingsManager,
         contextOverflowRecoveryOwner: "caller",
         customTools: [
@@ -156,6 +270,11 @@ describe("mid-turn provider admission", () => {
                 session.setBaseSystemPrompt("Additional instructions. ".repeat(6_000));
               } else if (tweakSystem) {
                 session.setBaseSystemPrompt(`${systemPrompt}Prefer concise answers.`);
+              } else if (tweakTools) {
+                session.agent.state.tools = session.agent.state.tools.map((tool) => ({
+                  ...tool,
+                  description: `${tool.description}. Return the report.`,
+                }));
               }
               return { content: [{ type: "text", text: "r".repeat(chars) }], details: {} };
             },
@@ -171,8 +290,24 @@ describe("mid-turn provider admission", () => {
               ]
             : messages;
       }
+      const activeContextEngine: ContextEngine | undefined = ownsCompaction
+        ? {
+            info: { id: "fixture", name: "Fixture", ownsCompaction: true },
+            ingest: async () => ({ ingested: true }),
+            assemble: async ({ messages }) => ({
+              messages: oversizedAssembly
+                ? [{ role: "user", content: "history ".repeat(40_000), timestamp: 1 }, ...messages]
+                : messages,
+              estimatedTokens: oversizedAssembly ? 1 : 1_000_000,
+            }),
+            compact: async () => ({ ok: false, compacted: false }),
+          }
+        : undefined;
+      fixture.input.activeContextEngine = activeContextEngine;
       Object.assign(fixture.input.attempt, {
-        config: { agents: { defaults: { compaction: { midTurnPrecheck: { enabled: true } } } } },
+        config: ownsCompaction
+          ? {}
+          : { agents: { defaults: { compaction: { midTurnPrecheck: { enabled: true } } } } },
         contextTokenBudget: model.contextWindow,
         model,
         modelId: model.id,
@@ -181,6 +316,7 @@ describe("mid-turn provider admission", () => {
       });
       const projectionState = createToolResultPromptProjectionState();
       const guards = installEmbeddedAttemptContextGuards({
+        activeContextEngine,
         activeSession: session,
         agentDir: "/fixture/agent",
         attempt: fixture.input.attempt,
@@ -210,6 +346,11 @@ describe("mid-turn provider admission", () => {
       runtime.cacheTrace = null;
       runtime.isOpenAIResponsesApi = opaque === true;
       runtime.transcriptPolicy = { ...runtime.transcriptPolicy, repairToolUseResultPairing: false };
+      const wireRequests: Array<{
+        max_tokens?: number;
+        messages: Array<Record<string, unknown>>;
+        response_format?: unknown;
+      }> = [];
       session.agent.streamFn = (_model, context) => {
         requests.push({ ...context, messages: structuredClone(context.messages) });
         const toolCall = {
@@ -274,6 +415,67 @@ describe("mid-turn provider admission", () => {
         }
         return createAssistantResultStream(message);
       };
+      if (compatibleBudget) {
+        const host = getAiTransportHost();
+        onTestFinished(() => configureAiTransportHost(host));
+        configureAiTransportHost({
+          ...host,
+          resolveProviderRequestCapabilities: (input) => ({
+            ...host.resolveProviderRequestCapabilities(input),
+            usesExplicitProxyLikeEndpoint: true,
+          }),
+          buildModelFetch: () => async (input, init) => {
+            wireRequests.push(await new Request(input, init).json());
+            const first = wireRequests.length === 1;
+            const event = {
+              id: `chatcmpl-fixture-${wireRequests.length}`,
+              object: "chat.completion.chunk",
+              created: 1,
+              model: model.id,
+              choices: [
+                {
+                  index: 0,
+                  finish_reason: first ? "tool_calls" : "stop",
+                  delta: first
+                    ? {
+                        tool_calls: [
+                          {
+                            index: 0,
+                            id: "read-report",
+                            type: "function",
+                            function: { name: "read", arguments: "{}" },
+                          },
+                        ],
+                      }
+                    : { content: "Report received." },
+                },
+              ],
+              usage: { prompt_tokens: usage, completion_tokens: 64, total_tokens: usage + 64 },
+            };
+            return new Response(`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`, {
+              headers: { "content-type": "text/event-stream" },
+            });
+          },
+        });
+        const transport = createOpenAICompletionsTransportStreamFn();
+        const responseFormat = responseSchema
+          ? {
+              type: "json_schema",
+              json_schema: {
+                name: "report",
+                schema: { type: "string", description: "x".repeat(16_000) },
+              },
+            }
+          : undefined;
+        session.agent.streamFn = (activeModel, context, options) => {
+          requests.push({ ...context, messages: structuredClone(context.messages) });
+          return transport(activeModel, context, {
+            ...options,
+            apiKey: "synthetic-key",
+            responseFormat,
+          });
+        };
+      }
       const streamGuards = installEmbeddedAttemptStreamGuards(fixture.input, {
         onRejectedProviderReplayRepaired: vi.fn(),
         onIdleTimeout: vi.fn(),
@@ -314,15 +516,26 @@ describe("mid-turn provider admission", () => {
           toolResultAggregateMaxChars: cap * 4,
           toolResultPromptProjectionState: projectionState,
           onModelRequest: streamGuards.onModelRequest,
-          preparePrimaryModelRequest: () =>
-            Promise.resolve(() => ({
-              systemPrompt: session.agent.state.systemPrompt,
-              tools: session.agent.state.tools,
-            })),
           promptActiveSession: (prompt, options) => session.prompt(prompt, options),
         });
-        expect(requests, session.agent.state.errorMessage).toHaveLength(fits ? 2 : 1);
-        expect(guards.takePendingMidTurnPrecheckRequest() !== null).toBe(!fits);
+        const pendingPrecheck = guards.takePendingMidTurnPrecheckRequest();
+        expect(requests, JSON.stringify(pendingPrecheck)).toHaveLength(
+          oversizedAssembly ? 0 : fits ? 2 : 1,
+        );
+        expect(pendingPrecheck !== null).toBe(!fits);
+        if (compatibleBudget) {
+          if (responseSchema) {
+            expect(wireRequests[0]?.response_format).toMatchObject({ type: "json_schema" });
+            expect(wireRequests[1]?.response_format).toEqual(wireRequests[0]?.response_format);
+          } else {
+            expect(
+              wireRequests.every((request) =>
+                request.messages.some((message) => message.reasoning_content === reasoningHistory),
+              ),
+            ).toBe(true);
+          }
+          expect(wireRequests.map((request) => request.max_tokens)).toEqual([8_192, 8_192]);
+        }
         if (fits) {
           const sent = requests[1]?.messages.find((message) => message.role === "toolResult");
           expect(sent?.content).toEqual([{ type: "text", text: expect.any(String) }]);

@@ -1,12 +1,9 @@
 import { stripCompactionReplayCheckpointInPlace } from "@openclaw/ai/transports";
-/**
- * Embedded-agent message text utilities.
- * Extracts visible assistant text, reasoning summaries, thinking-tag blocks,
- * and compact tool metadata for channel delivery and transcript replay.
- */
+import { createInlineCodeState } from "../../packages/markdown-core/src/code-spans.js";
 import type { AssistantMessage } from "../llm/types.js";
 import { extractTextFromChatContent } from "../shared/chat-content.js";
 import {
+  isAssistantTextContentBlockType,
   normalizeAssistantPhase,
   parseAssistantTextSignature,
   type AssistantPhase,
@@ -45,10 +42,6 @@ function sanitizeAssistantText(
       options,
     ),
   );
-}
-
-function isAssistantTextContentBlockType(value: unknown): boolean {
-  return value === "text" || value === "input_text" || value === "output_text";
 }
 
 export function sanitizeAssistantVisibleStreamText(
@@ -204,8 +197,11 @@ export function extractAssistantVisibleText(
   return prepareAssistantVisibleText(msg, prepareText)();
 }
 
-export function extractAssistantCommentaryText(msg: AssistantMessage): string {
-  return prepareEmbeddedAssistantTextForPhase(msg, "commentary")();
+export function extractAssistantCommentaryText(
+  msg: AssistantMessage,
+  prepareText?: Parameters<typeof prepareAssistantVisibleText>[1],
+): string {
+  return prepareEmbeddedAssistantTextForPhase(msg, "commentary", prepareText)();
 }
 
 export function extractEmbeddedAssistantText(msg: AssistantMessage): string {
@@ -287,6 +283,10 @@ export type ThinkingTagStreamState = {
   lastMatchEnd: number;
   lastTag?: { type: "open" | "close"; end: number };
 };
+
+export function createAssistantStreamBlockState() {
+  return { thinking: false, final: false, inlineCode: createInlineCodeState() };
+}
 
 export function createThinkingTagStreamState(): ThinkingTagStreamState {
   return {

@@ -102,7 +102,7 @@ export default defineControlUiPlugin({
         });
       }
     };
-    const catalog = new WorkboardCatalog(({ boards }) => syncBoardNavigation(boards), workboard);
+    const catalog = new WorkboardCatalog(syncBoardNavigation, workboard);
     const registrations = [
       host.ui.registerPage({
         id: "workboard",
@@ -116,6 +116,7 @@ export default defineControlUiPlugin({
             const index = boards.findIndex((entry) => entry.id === board.id);
             boards[index < 0 ? boards.length : index] = board;
             syncBoardNavigation(boards);
+            catalog.refresh();
           });
         }),
       }),
@@ -129,7 +130,7 @@ export default defineControlUiPlugin({
       host.ui.registerAccessory({
         id: "linked-card",
         placement: "session-header",
-        mount: createWorkboardSessionAccessory(workboard),
+        mount: createWorkboardSessionAccessory(),
       }),
       ...(["mini", "card", "board"] as const).map((id) =>
         host.ui.registerWidget({

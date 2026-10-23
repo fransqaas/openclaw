@@ -267,44 +267,21 @@ describe("buildLineMessageContext", () => {
     expect(context?.ctxPayload.RawBody).toBe("[Sent a sticker]");
   });
 
-  it("keeps inbound log previews UTF-16 well-formed at the limit", async () => {
-    const timestamp = 1_700_000_000_000;
-    await buildMessageContext(
-      createMessageEvent({ type: "user", userId: "user-1" }, {
-        timestamp,
-        message: { id: "baseline", type: "text", text: "BODY_MARKER" },
-      } as Partial<MessageEvent>),
-      {
-        cfg,
-      },
-    );
-    // Identity lookups log their own misses, so select the preview line by shape
-    // rather than by call order.
-    const baselineLog =
-      logVerboseMock.mock.calls
-        .map((call) => String(call[0]))
-        .find((line) => line.includes('preview="')) ?? "";
-    const baselinePreview = baselineLog.match(/preview="(.*)"$/)?.[1] ?? "";
-    const markerIndex = baselinePreview.indexOf("BODY_MARKER");
-    expect(markerIndex).toBeGreaterThanOrEqual(0);
-    const rawBody = `${"x".repeat(199 - markerIndex)}🚀tail`;
-    logVerboseMock.mockClear();
+  it.each(["message", "postback"])("preserves %s content without logging it", async (kind) => {
+    const rawBody = "private-line-message\n🚀";
+    const source = { type: "user", userId: "user-1" } as const;
+    const context =
+      kind === "message"
+        ? await buildMessageContext(
+            createMessageEvent(source, {
+              message: { id: "1", type: "text", text: rawBody },
+            } as Partial<MessageEvent>),
+          )
+        : await buildPostbackContext(createPostbackEvent(source, { postback: { data: rawBody } }));
 
-    await buildMessageContext(
-      createMessageEvent({ type: "user", userId: "user-1" }, {
-        timestamp,
-        message: { id: "1", type: "text", text: rawBody },
-      } as Partial<MessageEvent>),
-      {
-        cfg,
-      },
-    );
-    const expectedPreview = `${baselinePreview.slice(0, markerIndex)}${"x".repeat(199 - markerIndex)}`;
-    const formattedBodyLength = markerIndex + rawBody.length;
-
-    expect(logVerboseMock).toHaveBeenCalledWith(
-      `line inbound: from=line:user-1 len=${formattedBodyLength} preview="${expectedPreview}"`,
-    );
+    expect(context?.ctxPayload.RawBody).toBe(rawBody);
+    expect(context?.ctxPayload.BodyForAgent).toBe(rawBody);
+    expect(logVerboseMock.mock.calls.flat().join("\n")).not.toContain("private-line-message");
   });
 
   it("keeps failed media-only command text empty and preserves its native media fact", async () => {
@@ -523,44 +500,73 @@ describe("buildLineMessageContext", () => {
     });
   });
 
-  it("routes LINE conversations through active ACP session bindings", async () => {
-    const userId = "U1234567890abcdef1234567890abcdef";
-    const bindingService = getSessionBindingService();
-    await bindingService.bind({
-      targetSessionKey: "agent:codex:acp:binding:line:default:test123",
-      targetKind: "session",
-      conversation: {
-        channel: "line",
-        accountId: "default",
-        conversationId: userId,
-      },
-      placement: "current",
-      metadata: {
-        agentId: "codex",
-      },
-    });
-    const touchAsync = vi.spyOn(bindingService, "touchAsync").mockImplementation(async () => {});
+  it.each(["message", "postback"])(
+    "routes LINE %s through active ACP session bindings",
+    async (kind) => {
+      const userId = "U1234567890abcdef1234567890abcdef";
+      const bindingService = getSessionBindingService();
+      await bindingService.bind({
+        targetSessionKey: "agent:codex:acp:binding:line:default:test123",
+        targetKind: "session",
+        conversation: {
+          channel: "line",
+          accountId: "default",
+          conversationId: userId,
+        },
+        placement: "current",
+        metadata: {
+          agentId: "codex",
+        },
+      });
+      const touchAsync = vi.spyOn(bindingService, "touchAsync").mockImplementation(async () => {});
 
-    try {
-      const event = createMessageEvent({ type: "user", userId });
-      const context = await buildMessageContext(event);
+      try {
+        const buildBoundContext = (
+          resolveChannelIngress?: Parameters<
+            typeof buildLineMessageContext
+          >[0]["resolveChannelIngress"],
+        ) =>
+          kind === "message"
+            ? buildMessageContext(createMessageEvent({ type: "user", userId }), {
+                resolveChannelIngress,
+              })
+            : buildPostbackContext(createPostbackEvent({ type: "user", userId }), {
+                resolveChannelIngress,
+              });
+        const context = await buildBoundContext();
 
-      expect(context?.route.agentId).toBe("codex");
-      expect(context?.route.sessionKey).toBe("agent:codex:acp:binding:line:default:test123");
-      expect(context?.route.matchedBy).toBe("binding.channel");
-      if (!context) {
-        throw new Error("expected a bound LINE message context");
+        expect(context?.route.agentId).toBe("codex");
+        expect(context?.route.sessionKey).toBe("agent:codex:acp:binding:line:default:test123");
+        expect(context?.route.matchedBy).toBe("binding.channel");
+        if (!context) {
+          throw new Error("expected a bound LINE message context");
+        }
+        const routeMetadataKeys = Object.getOwnPropertySymbols(context.route);
+        expect(routeMetadataKeys).not.toHaveLength(0);
+        for (const key of routeMetadataKeys) {
+          expect(Reflect.get(context.ctxPayload, key)).toBe(Reflect.get(context.route, key));
+        }
+        expect(touchAsync).toHaveBeenCalledOnce();
+        getUserProfileMock.mockClear();
+        getLineGroupNameMock.mockClear();
+        const rejected = new Error("ingress refused");
+        const resolveChannelIngress = vi.fn(async () => {
+          throw rejected;
+        });
+        await expect(buildBoundContext(resolveChannelIngress)).rejects.toBe(rejected);
+        expect(resolveChannelIngress).toHaveBeenCalledExactlyOnceWith({
+          agentId: "codex",
+          sessionKey: "agent:codex:acp:binding:line:default:test123",
+          messageId: kind === "message" ? "1" : "postback:reply-token",
+          inboundEventKind: "user_request",
+        });
+        expect(getUserProfileMock).not.toHaveBeenCalled();
+        expect(getLineGroupNameMock).not.toHaveBeenCalled();
+      } finally {
+        touchAsync.mockRestore();
       }
-      const routeMetadataKeys = Object.getOwnPropertySymbols(context.route);
-      expect(routeMetadataKeys).not.toHaveLength(0);
-      for (const key of routeMetadataKeys) {
-        expect(Reflect.get(context.ctxPayload, key)).toBe(Reflect.get(context.route, key));
-      }
-      expect(touchAsync).toHaveBeenCalledOnce();
-    } finally {
-      touchAsync.mockRestore();
-    }
-  });
+    },
+  );
 
   it("gives the agent the sender's and the group's name instead of their ids", async () => {
     getUserProfileMock.mockResolvedValueOnce({ displayName: "Sora" });

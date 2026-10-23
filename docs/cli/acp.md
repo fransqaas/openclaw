@@ -42,10 +42,13 @@ Quick rule:
 | Client filesystem methods (`fs/read_text_file`, `fs/write_text_file`) | Unsupported | The bridge does not call ACP client filesystem methods.                                                                                                                                                                               |
 | Client terminal methods (`terminal/*`)                                | Unsupported | The bridge does not create ACP client terminals or stream terminal ids through tool calls.                                                                                                                                            |
 
-Assistant narration appears as `agent_message_chunk` updates before the related tool calls. When the Gateway reclassifies streamed text as commentary, the bridge preserves that narration once and tracks the final answer separately, so tool use does not truncate the answer or replay the narration.
+Visible assistant text appears as append-only `agent_message_chunk` updates, including narration before tool calls and the answer afterward. Providers without explicit text phases do not retroactively reclassify earlier text when tools or reasoning arrive. Explicit OpenAI Responses and Harmony commentary/final phases remain distinct, so narration is preserved once and the final answer streams completely. Reasoning visibility and private-tag filtering still apply.
+
+Gateway failure explanations appear as `[OpenClaw interruption]` message updates before the prompt settles and are included in session replay. A partial answer that reaches the model output token limit returns the ACP stop reason `max_tokens`; user cancellation returns `cancelled`.
 
 ## Known limitations
 
+- ACP v1 cannot retract or replace text already displayed. Repeated snapshots of the same item append only a suffix that extends the displayed text; incompatible rewrites are ignored rather than replayed as duplicated narration.
 - `loadSession` replays complete ACP event-ledger history only for bridge-created sessions. Older/no-ledger sessions use transcript fallback and do not reconstruct historic tool calls or system notices. Replay history is bounded by session, event, and retained-content limits; the default byte budget is 16 MiB of UTF-8 text plus row overhead. Truncated history also uses transcript fallback. See [ACP replay accounting](/reference/database-schemas#acp-replay-accounting).
 - If multiple ACP clients share the same Gateway session key, event and cancel routing are best-effort rather than strictly isolated per client. Prefer the default isolated `acp-bridge:<uuid>` sessions when you need clean editor-local turns.
 - Gateway stop states translate into ACP stop reasons, but that mapping is less expressive than a fully ACP-native runtime.
@@ -74,6 +77,13 @@ openclaw acp --session-label "support inbox"
 # Reset the session key before the first prompt
 openclaw acp --session agent:main:main --reset-session
 ```
+
+For a new bridge-owned session, ACP `session/new` persists its absolute `cwd`
+through Gateway session creation, so later prompts execute in that directory.
+The directory is on the Gateway host and follows its existing workspace and
+`operator.admin` policy. Sessions selected by key or label retain their existing
+Gateway-owned directory. `--no-prefix-cwd` only controls the prompt's directory
+hint.
 
 ## ACP client (debug)
 
