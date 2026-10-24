@@ -120,6 +120,7 @@ describe("active-memory decision escalation", () => {
       {
         agentId: "main",
         purpose: ACTIVE_MEMORY_ESCALATION_DECISION_PURPOSE,
+        priority: "optional",
         rubricVersion: ACTIVE_MEMORY_ESCALATION_RUBRIC_VERSION,
         timeoutMs: 750,
         signal,

@@ -146,8 +146,9 @@ Active Memory asks one Boolean question (`deepRecall`) for purpose
 strong hit. A `probabilityTrue` of at least 0.5 runs deep recall; a lower value
 skips it. The request carries only the bounded latest user message and search
 query, and it must answer within the remaining preflight budget (at most one
-second); a late answer never replaces the matcher. Without Decision assistance
-or a selected Decision model, and when the model is unavailable, fails, times
+second); a late answer never replaces the matcher. The request uses optional
+priority, so it never takes a provider's last free evaluation slot. Without Decision assistance
+or a selected Decision model, and when the model is unavailable or busy, fails, times
 out, or returns an invalid answer, the built-in intent matcher decides as
 before. Active Memory keeps rechecking both opt-ins while a question is pending: withdrawing either cancels the request before it is sent when possible and discards any answer that still arrives. Modes `"off"` and `"always"` never ask. Hosted Decision models receive
 that bounded text and may charge for each evaluation; prefer a local model for

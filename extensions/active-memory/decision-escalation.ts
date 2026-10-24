@@ -146,6 +146,8 @@ export function createActiveMemoryDecisionEscalationDecider(params: {
         {
           agentId: params.agentId,
           purpose: ACTIVE_MEMORY_ESCALATION_DECISION_PURPOSE,
+          // Recall escalation is best-effort: never take a provider's last slot.
+          priority: "optional",
           rubricVersion: ACTIVE_MEMORY_ESCALATION_RUBRIC_VERSION,
           timeoutMs,
           signal,
