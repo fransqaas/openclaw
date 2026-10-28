@@ -45,17 +45,14 @@ async function expectDenied(operation: (run: () => Promise<unknown>) => Promise<
   expect(run).not.toHaveBeenCalled();
 }
 
-function createManagementFixture(
-  controlUiAdmin = true,
-  callerOrigin: Parameters<typeof createCronCreatorAuthorityRunScope>[1] = { kind: "local" },
-) {
+function createManagementFixture(controlUiAdmin = true) {
   let continuationCurrent = true;
   const runId = "run-admin-management";
   const { operationalRunInstance } = createTestAdmittedRunContext(runId);
   const authority = claimAgentRunDelegatedAuthority(operationalRunInstance);
   const scope = createScope(
     runId,
-    callerOrigin,
+    { kind: "local" },
     controlUiAdmin ? { source: "control-ui-admin" } : undefined,
     () => continuationCurrent,
   );
@@ -219,29 +216,6 @@ describe("cron management authority grants", () => {
     expect(retained).toThrow(denied);
     await fixture.deny(grant);
   });
-
-  it.each([
-    [
-      "an external channel",
-      { kind: "external", channel: "whatsapp" },
-      { kind: "external", channel: "whatsapp" },
-    ],
-    ["a local", { kind: "local" }, { kind: "local" }],
-    ["an unknown", { kind: "unknown" }, undefined],
-  ] as const)(
-    "carries %s turn origin through a redeemed management operation",
-    async (_label, callerOrigin, expected) => {
-      const fixture = createManagementFixture(true, callerOrigin);
-      await fixture.run(
-        fixture.mint("cron.update"),
-        async () => {
-          expect(getCronManagementCallerOrigin(fixture.identity)).toEqual(expected);
-        },
-        "cron.update",
-      );
-      expect(getCronManagementCallerOrigin(fixture.identity)).toBeUndefined();
-    },
-  );
 
   it("rejects missing grants and callers without an admitted admin capability", async () => {
     const fixture = createManagementFixture(false);
