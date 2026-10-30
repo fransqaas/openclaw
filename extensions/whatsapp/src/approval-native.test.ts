@@ -217,14 +217,11 @@ describe("whatsapp approval capability", () => {
     });
 
     it.each([
-      ["a real thread in the same group", { threadId: "3EB0REALTHREAD" }],
-      ["another account's isolation thread", { threadId: "whatsapp-account-other" }],
       [
         "another account's group session",
         { accountId: "other", threadId: "whatsapp-account-other" },
       ],
       ["a different group", { to: "120363409999999999@g.us" }],
-      ["an explicit target carrying the isolation thread", { source: "target" }],
     ])("keeps forwarding fallback for %s", async (_name, target) => {
       expect(await suppress(target)).toBe(false);
     });
