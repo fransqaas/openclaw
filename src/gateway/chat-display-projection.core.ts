@@ -37,6 +37,7 @@ import {
   hasTranscriptMediaFacts,
   isAssistantTextContentType,
   isAssistantInternalReasoningContentType,
+  projectReplyMediaFailureText,
 } from "./chat-display-projection.helpers.js";
 import {
   createSubagentCoordinationHistoryProjection,
@@ -307,6 +308,32 @@ function hasVisibleAssistantReplyText(message: Record<string, unknown>): boolean
   });
 }
 
+function isCompletedAssistantMessage(message: Record<string, unknown>): boolean {
+  return (
+    message.role === "assistant" &&
+    (message.stopReason === "stop" || message.stopReason === "length")
+  );
+}
+
+/** Sanitized reasoning is display material without being a recovery-completing answer. */
+function hasAssistantHistoryMaterial(message: Record<string, unknown>): boolean {
+  return (
+    hasVisibleAssistantReplyText(message) ||
+    hasAssistantDisplayableNonTextContent(message) ||
+    hasTranscriptMediaFacts(message) ||
+    (Array.isArray(message.content) &&
+      message.content.some((block) => {
+        const entry = asOptionalRecord(block);
+        return (
+          isAssistantInternalReasoningContentType(entry?.type) &&
+          [entry?.thinking, entry?.text].some(
+            (value) => typeof value === "string" && value.trim().length > 0,
+          )
+        );
+      }))
+  );
+}
+
 function isDiagnosticOnlyAssistantError(value: unknown): boolean {
   const message = asOptionalRecord(value);
   return (
@@ -391,18 +418,10 @@ export function createChatHistoryRecoveryProjection(options?: ChatHistoryRecover
       pendingIndexes.push(index);
       return;
     }
-    const hasVisibleAssistant = hasVisibleAssistantDisplayContent(message);
     if (
-      message.role === "assistant" &&
-      (message.stopReason === "stop" || message.stopReason === "length") &&
-      !hasVisibleAssistant &&
-      !unseenPending &&
-      pendingIndexes.length === 0
+      (!unseenPending && pendingIndexes.length === 0) ||
+      !hasVisibleAssistantDisplayContent(message)
     ) {
-      messages.pop();
-      return;
-    }
-    if ((!unseenPending && pendingIndexes.length === 0) || !hasVisibleAssistant) {
       return;
     }
     // An incremental reader carries only a pending bit. It must reload raw
@@ -596,7 +615,9 @@ export function projectChatDisplayMessagesWithState(
   // Recovery already admitted records and consumed assistant display content.
   const sanitizedMessages = sanitizeChatHistoryMessages(projectedErrors, Number.MAX_SAFE_INTEGER, {
     includeCommentaryFallbacks: options?.includeCommentaryFallbacks,
-  });
+  }).filter(
+    (message) => !isCompletedAssistantMessage(message) || hasAssistantHistoryMaterial(message),
+  );
   const commentaryFallbacksObserved =
     options?.includeCommentaryFallbacks === true &&
     sanitizedMessages.some(
@@ -612,7 +633,10 @@ export function projectChatDisplayMessagesWithState(
     options?.turnBoundaryPending,
   );
   const displayMessages = sanitizeChatHistoryMessages(
-    mergeTtsSupplementMessages(filtered.messages),
+    mapChatDisplayMessages(
+      mergeTtsSupplementMessages(filtered.messages),
+      projectReplyMediaFailureText,
+    ),
     options?.maxChars ?? DEFAULT_CHAT_HISTORY_TEXT_MAX_CHARS,
     { toolResultMaxChars: options?.toolResultMaxChars },
   );

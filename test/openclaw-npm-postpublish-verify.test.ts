@@ -283,7 +283,7 @@ it("rejects a matching provenance payload when Sigstore cannot verify its bundle
 it("retries incomplete or briefly stale provenance while npm publish propagates", async () => {
   const delays: number[] = [];
   const failures = [
-    "npm provenance attestation does not bind 2026.3.23 to the trusted OpenClaw GitHub release workflow.",
+    "npm registry metadata is incomplete for openclaw@2026.3.23.",
     "npm registry provenance metadata is incomplete for openclaw@2026.3.23.",
   ];
   const read = vi
@@ -299,6 +299,22 @@ it("retries incomplete or briefly stale provenance while npm publish propagates"
   ).resolves.toBe("verified");
   expect(read).toHaveBeenCalledTimes(3);
   expect(delays).toEqual([1000, 2000]);
+});
+
+it.each([
+  "npm provenance attestation does not bind 2026.3.23 to the trusted OpenClaw GitHub release workflow.",
+  "npm registry signature verification timed out after an integrity mismatch.",
+])("does not retry permanent provenance or integrity mismatch: %s", async (message) => {
+  const read = vi.fn<() => Promise<string>>().mockRejectedValue(new Error(message));
+  await expect(
+    retryNpmRegistryProvenanceRead(read, {
+      attempts: 3,
+      delay: async () => {
+        throw new Error("unexpected retry");
+      },
+    }),
+  ).rejects.toThrow(message);
+  expect(read).toHaveBeenCalledOnce();
 });
 
 it("rejects an oversized worker before the full verifier reads its contents", () => {
@@ -440,11 +456,26 @@ function makeLegacyFixture(source = legacyCompanionSource, fileName?: string) {
   };
 }
 
-it("uses generated region ownership only when the compatibility gate is enabled", () => {
-  const { packageRoot, legacyErrors } = makeLegacyFixture();
-  expectDependencyErrors(packageRoot, "@discordjs/voice");
-  expect(legacyErrors()).toStrictEqual([]);
-});
+it.each(["//#region", "//"])(
+  "uses generated source ownership only when the compatibility gate is enabled (%s)",
+  (label) => {
+    const source = legacyCompanionSource
+      .replace("//#region", label)
+      .replace("//#endregion", label === "//" ? "" : "//#endregion");
+    const { packageRoot, legacyErrors } = makeLegacyFixture(source);
+    expectDependencyErrors(packageRoot, "@discordjs/voice");
+    expect(legacyErrors()).toStrictEqual([]);
+  },
+);
+
+it.each(["//#region", "//"])(
+  "does not infer plugin ownership from labels inside strings (%s)",
+  (label) => {
+    const source = `const text = \`\n${label} extensions/discord/src/voice/sdk-runtime.ts\nconst harmless = true;\n//#endregion\n\`;\nrequire("@discordjs/voice");`;
+    const { legacyErrors } = makeLegacyFixture(source);
+    expect(legacyErrors()).toEqual([expect.stringContaining("@discordjs/voice")]);
+  },
+);
 
 it("preserves plugin ownership through hoisted static imports", () => {
   const { packageRoot, legacyErrors } = makeLegacyFixture();
@@ -467,11 +498,17 @@ it("keeps legacy directory entrypoints root-owned", () => {
   expect(legacyErrors()).toEqual([expect.stringContaining("@discordjs/voice")]);
 });
 
-it("rejects legacy ownership for a loader used outside its plugin region", () => {
-  const source = `import { createRequire } from "node:module";\n${pluginRegion('const load = createRequire(import.meta.url); load("@discordjs/voice");')}\nload("@discordjs/voice");`;
-  const { legacyErrors } = makeLegacyFixture(source);
-  expect(legacyErrors()).toEqual([expect.stringContaining("@discordjs/voice")]);
-});
+it.each(["//#region", "//"])(
+  "rejects legacy ownership for a loader used outside its plugin region (%s)",
+  (label) => {
+    const source =
+      `import { createRequire } from "node:module";\n${pluginRegion('const load = createRequire(import.meta.url); load("@discordjs/voice");')}\n// src/root.ts\nload("@discordjs/voice");`
+        .replace("//#region", label)
+        .replace("//#endregion", label === "//" ? "" : "//#endregion");
+    const { legacyErrors } = makeLegacyFixture(source);
+    expect(legacyErrors()).toEqual([expect.stringContaining("@discordjs/voice")]);
+  },
+);
 
 it.each<[string, Parameters<typeof makeCompanionImportFixture>[0], string[]]>([
   ["Bun built-ins", { source: 'import "bun:sqlite"; require("bun:ffi");' }, []],

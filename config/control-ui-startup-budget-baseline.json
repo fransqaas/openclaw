@@ -1,5 +1,5 @@
 {
-  "startupJsGzipBytes": 90195,
-  "reason": "Early transport overlaps cold boot without delaying cached reloads; final current-main build measures 90,195 B gzip in 3 startup requests.",
-  "updatedAt": "2026-10-27"
+  "startupJsGzipBytes": 88830,
+  "reason": "Integrated long-tail candidate measures 88,830 B startup gzip, 46 B above its exact base, with unchanged 277,773 B raw JS, three JS requests and one CSS request. Twenty interleaved pairs reduce Skills desktop visit and filter CPU by about 70%; record the measured candidate after main integration.",
+  "updatedAt": "2026-10-31"
 }

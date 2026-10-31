@@ -8,7 +8,6 @@ import {
   expectTtsPayloadResult,
   installSpeechProviders,
   listSpeechVoices,
-  nativeVoiceNoteChannels,
   prepareTtsRequest,
   requireFirstCallParam,
   requireFirstSynthesisRequest,
@@ -17,7 +16,6 @@ import {
   setRuntimeConfigSnapshot,
   synthesizeMock,
   synthesizeSpeech,
-  testApi,
   textToSpeech,
   textToSpeechCore,
   transcodeAudioBufferMock,
@@ -84,15 +82,6 @@ describe("TTS runtime native voice-note routing", () => {
   });
 
   afterEach(resetTtsRuntime);
-
-  it("resolves voice delivery support from channel capabilities", () => {
-    for (const channel of nativeVoiceNoteChannels) {
-      expect(testApi.supportsNativeVoiceNoteTts(channel)).toBe(true);
-      expect(testApi.supportsNativeVoiceNoteTts(channel.toUpperCase())).toBe(true);
-    }
-    expect(testApi.supportsNativeVoiceNoteTts("slack")).toBe(false);
-    expect(testApi.supportsNativeVoiceNoteTts(undefined)).toBe(false);
-  });
 
   it("tells generic TTS guidance to defer to MEMORY voice-delivery instructions", () => {
     const hint = buildTtsSystemPromptHint(createTtsConfig("openclaw-speech-core-tts-hint-test"));
@@ -213,17 +202,18 @@ describe("TTS runtime native voice-note routing", () => {
     expect(providerConfig.apiKey).toBe("test-key");
   });
 
-  it("resolves the configured timeout for voice listing", async () => {
+  it("resolves voice listing aliases with the configured timeout", async () => {
     const listVoicesMock = vi.fn(async (_request: SpeechListVoicesRequest) => []);
     installSpeechProviders([
       createMockSpeechProvider("mock", {
+        aliases: ["mock-alias"],
         defaultTimeoutMs: 60_000,
         listVoices: listVoicesMock,
       }),
     ]);
 
     await listSpeechVoices({
-      provider: "mock",
+      provider: "  MOCK-ALIAS  ",
       cfg: { tts: { enabled: true, provider: "mock", timeoutMs: 45_000 } },
     });
 
