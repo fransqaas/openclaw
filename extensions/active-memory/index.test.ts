@@ -614,6 +614,7 @@ describe("active-memory plugin", () => {
   });
 
   registerActiveMemoryProviderTests({
+    logger: api.logger,
     memoryCapability: hoisted.memoryCapability,
     getActiveMemoryProvider: hoisted.getActiveMemoryProvider,
     getActiveMemorySearchManager: hoisted.getActiveMemorySearchManager,
