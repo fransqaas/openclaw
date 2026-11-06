@@ -29,6 +29,12 @@ export type DecisionEvaluateOptions = {
    * result permanently disables this evaluation; throws/non-booleans reject.
    */
   readonly admit?: () => boolean;
+  /**
+   * Caller-owned authority (for example a revocable data grant). The host calls it
+   * before preparation, at every physical dispatch and retry, and before completion;
+   * a throw ends the request and rejects with that error.
+   */
+  readonly assertCurrent?: () => void;
 };
 
 /** Adds only provider-declared reasoning to the established caller contract. */
